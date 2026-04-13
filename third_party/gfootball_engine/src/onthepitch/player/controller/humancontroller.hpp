@@ -61,6 +61,15 @@ class HumanController : public PlayerController {
     AIControlledKeyboard *GetHIDevice() { return hid; }
 
     int GetActionMode() { DO_VALIDATION; return actionMode; }
+    // 返回当前蓄力时间（毫秒），用于UI力量槽显示
+    // 若射门按键已记录开始时间，则返回基于游戏时间的实际按压时长
+    int GetGauge_ms() const { return gauge_ms; }
+    // 返回射门按键按下至今的游戏时间（ms），比 gauge_ms 更准确（跨环境步）
+    int GetShotPressStartTime_ms() const { return shotPressStartTime_ms; }
+    // 返回射门命令推入时的冻结 gauge（ms），-1 表示尚未推入（仍在蓄力中）
+    int GetShotQueuedGauge_ms() const { return shotQueuedGauge_ms; }
+    // 返回当前动作按键类型，用于判断是否是射门蓄力
+    e_ButtonFunction GetActionButton() const { return actionButton; }
 
     virtual void Reset();
 
@@ -78,6 +87,11 @@ class HumanController : public PlayerController {
     e_ButtonFunction actionButton;
     int actionBufferTime_ms = 0;
     int gauge_ms = 0;
+    // 射门按键按下的游戏时间戳（ms），用于跨环境步计算实际按压时长
+    int shotPressStartTime_ms = -1;
+    // 射门命令推入队列时的 gauge 快照（ms），-1 表示尚未推入
+    // 推入后力量槽冻结在此值，不再随时间增长
+    int shotQueuedGauge_ms = -1;
 
     // stuff to keep track of analog stick (or keys even) so that we can use a direction once it's been pointed in for a while, instead of directly
     Vector3 previousDirection;

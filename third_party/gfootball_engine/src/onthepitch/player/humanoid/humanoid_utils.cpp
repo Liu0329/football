@@ -423,16 +423,22 @@ Vector3 GetShotVector(Match *match, Player *player, const Vector3 &nextStartPos,
                       (0.4f + positionOffsetPowerFactor * 0.6f);
   powerFactor = clamp(powerFactor, 0.0f, 1.0f);
 
+  // 射门基础球速：线性映射 desiredPower [0,1] → 球速 [20, 60] m/s
+  // 短按(desiredPower≈0) → 20 m/s；长按(desiredPower=1) → 60 m/s
+  // 力量槽显示比例 = adaptedDesiredPower / 60，与此公式完全一致
   float adaptedDesiredPower =
-      45.0f *
-      (0.7f +
-       std::pow(currentAnim.originatingCommand.touchInfo.desiredPower, 0.5f) *
-           0.3f);
+      20.0f + currentAnim.originatingCommand.touchInfo.desiredPower * 40.0f;
 
   float animMaxPowerFactor = atof(currentAnim.anim->GetVariable("touch_maxpowerfactor").c_str());
   if (animMaxPowerFactor == 0.0f) animMaxPowerFactor = 1.0f;
 
-  float power = clamp(powerFactor * adaptedDesiredPower, 0.0f, (32.0f + player->GetStat(physical_shotpower) * 13.0f) * (0.2f + animMaxPowerFactor * 0.8f));
+  // 上限：满属性(physical_shotpower=1)满动画 = (43+17) * 1.0 = 60 m/s
+  float power = clamp(powerFactor * adaptedDesiredPower, 0.0f, (43.0f + player->GetStat(physical_shotpower) * 17.0f) * (0.2f + animMaxPowerFactor * 0.8f));
+
+  printf("[GetShotVector] desiredPower=%.3f  adaptedDesiredPower=%.2f  powerFactor=%.3f  power_before_mov=%.2f  animMaxPowerFactor=%.3f  shotpower_stat=%.3f\n",
+         currentAnim.originatingCommand.touchInfo.desiredPower,
+         adaptedDesiredPower, powerFactor, power, animMaxPowerFactor,
+         player->GetStat(physical_shotpower));
 
   // add this after previous stat-clamp, because using the current ball movement is like an added (power) bonus that everybody profits from, even sucky players
   float playerMovBallMovPowerFactor = (touchMovement - ball->GetMovement()).GetLength();

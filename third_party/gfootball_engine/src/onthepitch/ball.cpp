@@ -26,12 +26,30 @@
 
 #include "../main.hpp"
 
-constexpr float bounce = 0.62f;  // 1 = full bounce, 0 = no bounce
-constexpr float linearBounce = 0.06f;  // bigger = more brake force
-constexpr float drag = 0.015f;  // bigger = more
-constexpr float friction = 0.04f;  // bigger = more
-constexpr float linearFriction = 1.6f;  // bigger = more, arbitrary scale;
+// ===== 球物理参数 =====
+
+// 弹跳系数：1=完全弹起，0=不弹。现实足球约0.6~0.7
+constexpr float bounce = 0.62f;
+
+// 线性弹跳衰减：落地时额外减去的垂直速度（m/s），模拟地面对弹跳的硬性吸收
+constexpr float linearBounce = 0.06f;
+
+// 空气阻力系数（二次项）：F_drag = drag * v^2，对快速飞行的球影响较大
+// 0.015 → 约 60m/s 球每秒损失约 54m/s 的速度（纯空气阻力）
+constexpr float drag = 0.015f;
+
+// 草地摩擦力系数（二次项，滚动时）：F_fric = friction * v^2
+// 数值越大，球在地面减速越快；原值 0.04，调小可让地滚球滑得更远
+constexpr float friction = 0.025f;  // 原值 0.04，减小以降低草地摩擦
+
+// 草地线性摩擦力（一次项）：每秒固定减速量（m/s），负责让球最终完全停下
+// 数值越大，球停得越快；原值 1.6，调小可让低速球继续滚动更长时间
+constexpr float linearFriction = 0.9f;  // 原值 1.6，减小以降低线性摩擦
+
+// 重力加速度（m/s²），标准值 9.81
 constexpr float gravity = -9.81f;
+
+// 草的高度（m）：球在此高度以内时受地面摩擦影响，模拟草皮与球的接触区间
 constexpr float grassHeight = 0.025f;
 
 Ball::Ball(Match *match) : match(match) {
@@ -178,56 +196,53 @@ BallSpatialInfo Ball::CalculatePrediction() {
     float frictionFactor = 0.0f;
 
 
-    // gravity
-
-    // vz = vz0 + g * t
+    // 重力：每帧对垂直速度积分，vz += g * dt
     momentumPredict.coords[2] = momentumPredict.coords[2] + gravity * timeStep;
 
 
-    // air resistance
-
+    // 空气阻力（二次项）：Δv = -drag * v² * dt，速度越快阻力越大
+    // 对地滚球影响很小（v低），主要影响射门后的高速飞球
     float momentumVelo = momentumPredict.GetLength();
     float momentumVeloDragged =
         momentumVelo - drag * std::pow(momentumVelo, 2.0f) * timeStep;
     if (drag_enabled) momentumPredict = momentumPredict.GetNormalized(0) * momentumVeloDragged;
 
 
+    // 草皮影响系数：球离地面越近，摩擦越大
+    // ballBottom=0 时 grassInfluenceBias=1（完全接触），随高度增加而减小
     float ballBottom = nextPos.coords[2] - 0.11f;
     float grassInfluenceBias = clamp(1.0f - (ballBottom / grassHeight), 0.0f, 1.0f); // 0 == no friction, 1 == all friction
+    // 指数0.7使曲线下凸：在半草高处已有超过50%的摩擦影响
+    grassInfluenceBias = std::pow(grassInfluenceBias, 0.7f);
 
-    grassInfluenceBias = std::pow(
-        grassInfluenceBias, 0.7f);  // at half grass height, there's already a
-                                    // bigger amount of friction than 50%
-    // printf("%f\n", bias);
-
-    // bounce
-
+    // 落地弹跳：球心低于球半径(0.11m)时触发
     if (nextPos.coords[2] < 0.11f) {
       DO_VALIDATION;
       if (momentumPredict.coords[2] < 0.0f) {
         DO_VALIDATION;
-        frictionFactor = NormalizedClamp(-momentumPredict.coords[2] - 0.5f, 0.0f, 12.0f); // when the ball is slammed into the ground, there's gonna be more friction. only set it here so it is only done once (on impact)
+        // 落地冲击摩擦系数：落地越猛，水平摩擦越大（仅在落地瞬间生效一次）
+        frictionFactor = NormalizedClamp(-momentumPredict.coords[2] - 0.5f, 0.0f, 12.0f);
+        // 弹跳：反转垂直速度并乘以弹跳系数
         momentumPredict.coords[2] = -momentumPredict.coords[2] * bounce;
-        momentumPredict.coords[2] = std::max(momentumPredict.coords[2] - linearBounce, 0.0f); // linear bounce
+        // 线性弹跳衰减：确保小弹跳完全被吸收，防止无限小弹
+        momentumPredict.coords[2] = std::max(momentumPredict.coords[2] - linearBounce, 0.0f);
       }
-
       nextPos.coords[2] = 0.11f;
     }
 
-    // ground friction
-
+    // 草地摩擦力（仅对地面附近的球生效）
     if (nextPos.coords[2] < 0.11f + grassHeight && groundFriction_enabled) {
       DO_VALIDATION;
+      // 按草皮接触程度缩放摩擦系数
       float adaptedFriction = (friction * grassInfluenceBias);
-
-      // v(t) = v(0) * (k ^ t)
 
       Vector3 xy = momentumPredict.Get2D();
       float velo = xy.GetLength();
 
+      // 二次摩擦项：Δv = -friction * v² * dt，高速时减速快
       float newVelo = velo - adaptedFriction * std::pow(velo, 2.0f) * timeStep;
 
-      // linear friction
+      // 线性摩擦项：Δv = -linearFriction * dt，保证球最终能停下来
       newVelo = clamp(newVelo - (linearFriction * grassInfluenceBias * timeStep), 0.0f, 100000.0f);
 
       xy.Normalize(Vector3(0));

@@ -48,6 +48,10 @@ namespace blunted {
 
       Vector3 color1_1, color1_2, color2_1, color2_2;
 
+      // 射门力量槽：位于小地图下方的窄条，仅在玩家蓄力射门时显示
+      boost::intrusive_ptr<Image2D> shotPowerBar;
+      bool shotPowerBarVisible = false;
+
   };
 
 }

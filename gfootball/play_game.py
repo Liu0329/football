@@ -175,6 +175,8 @@ def main(_):
       'players': players,
       'real_time': FLAGS.real_time,
       'level': level,
+      # PHYSICS_STEPS_PER_SECOND=100，steps_per_frame=10 → 10 FPS（默认值）
+      'physics_steps_per_frame': 10,
   }
   cfg = config.Config(cfg_values)
   env = football_env.FootballEnv(cfg)

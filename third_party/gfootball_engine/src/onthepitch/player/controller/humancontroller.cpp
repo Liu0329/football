@@ -54,8 +54,7 @@ void HumanController::RequestCommand(PlayerCommandQueue &commandQueue) {
   _SetInput(rawInputDirection, rawInputVelocityFloat);
 
 
-  // clear buffer?
-
+  // 清除动作缓冲区：若当前动画已是对应动作（短传/长传/高球/射门）且触球已完成，则重置状态
   e_FunctionType functionType = CastPlayer()->GetCurrentFunctionType();
   if (actionMode == 2 &&
       (functionType == e_FunctionType_ShortPass ||
@@ -67,6 +66,8 @@ void HumanController::RequestCommand(PlayerCommandQueue &commandQueue) {
     actionMode = 0;
     gauge_ms = 0;
     actionBufferTime_ms = 0;
+    shotPressStartTime_ms = -1;
+    shotQueuedGauge_ms = -1;
   }
 
   if (actionMode == 1 &&
@@ -79,8 +80,7 @@ void HumanController::RequestCommand(PlayerCommandQueue &commandQueue) {
     actionBufferTime_ms = 0;
   }
 
-  // cancels
-
+  // 取消操作：按下短传键可取消射门或高球的蓄力
   // shot cancel
   if (actionMode == 2 && actionButton == e_ButtonFunction_Shot &&
       hid->GetButton(e_ButtonFunction_ShortPass) && !match->IsInSetPiece()) {
@@ -88,6 +88,8 @@ void HumanController::RequestCommand(PlayerCommandQueue &commandQueue) {
     actionMode = 0;
     gauge_ms = 0;
     actionBufferTime_ms = 0;
+    shotPressStartTime_ms = -1;
+    shotQueuedGauge_ms = -1;
   }
 
   // high pass cancel
@@ -99,7 +101,7 @@ void HumanController::RequestCommand(PlayerCommandQueue &commandQueue) {
     actionBufferTime_ms = 0;
   }
 
-  // cancel action buffer
+  // 动作缓冲超时（2秒）或球越来越远时取消
   if (actionMode == 2 && !match->IsInSetPiece() &&
       (actionBufferTime_ms > 2000 ||
        CastPlayer()->GetTimeNeededToGetToBall_ms() >
@@ -111,7 +113,7 @@ void HumanController::RequestCommand(PlayerCommandQueue &commandQueue) {
     actionBufferTime_ms = 0;
   }
 
-  // cancel pressure and such
+  // 防守类动作（逼抢等）缓冲超时（1秒）取消
   if (actionMode == 1 && actionBufferTime_ms > 1000) {
     DO_VALIDATION;
     actionMode = 0;
@@ -119,14 +121,23 @@ void HumanController::RequestCommand(PlayerCommandQueue &commandQueue) {
     actionBufferTime_ms = 0;
   }
 
-  // execute buffer?
-
+  // 执行缓冲中的动作：
+  // 满足以下任一条件时触发动作：
+  //   1. 按键已松开
+  //   2. 蓄力超过500ms（提前触发，动画还有时间追上触球）
+  //   3. 没有球权且等待时间已 > 0（非定位球情况）
   if (actionMode == 2) {
     DO_VALIDATION;
 
+    // 用时间戳计算实际按压时长，避免依赖 gauge_ms（每帧被 ResetNotSticky 清除）
+    int currentEffectiveGauge_ms = gauge_ms;
+    if (actionButton == e_ButtonFunction_Shot && shotPressStartTime_ms >= 0) {
+      int elapsed = match->GetActualTime_ms() - shotPressStartTime_ms;
+      currentEffectiveGauge_ms = clamp(elapsed, 10, 1000);
+    }
     if (!hid->GetButton(actionButton) ||
         (hid->GetButton(actionButton) &&
-         gauge_ms >
+         currentEffectiveGauge_ms >
              500) ||  // allow anim to kick in before queue is complete (before
                       // button is released), it will usually touch ball after
                       // the remaining time anyway, so we still have time to add
@@ -135,6 +146,8 @@ void HumanController::RequestCommand(PlayerCommandQueue &commandQueue) {
          actionBufferTime_ms > 0)) {
       DO_VALIDATION;
 
+      // baseTime_ms：人类物理上无法按得更短的最小时长（60ms），从有效蓄力时间中减去
+      // gaugeFactor：归一化到 [0, 1] 的蓄力比例，满蓄约需按住 1000ms
       int baseTime_ms = 60; // substract a little because we can't really press a button shorter than this
       float gaugeFactor = (gauge_ms - baseTime_ms) * (1.0f / float(1000 - baseTime_ms));
       gaugeFactor = clamp(gaugeFactor, 0.0f, 1.0f);
@@ -170,6 +183,7 @@ void HumanController::RequestCommand(PlayerCommandQueue &commandQueue) {
         command.useDesiredMovement = false;
         command.useDesiredLookAt = false;
 
+        // 短传力量：pow指数0.7，曲线较陡，短按即可达到较高力量
         float inputPower = clamp(std::pow(gaugeFactor, 0.7f), 0.01f, 1.0f);
         command.touchInfo.inputDirection = inputDirection;
         command.touchInfo.inputPower = inputPower;
@@ -187,6 +201,7 @@ void HumanController::RequestCommand(PlayerCommandQueue &commandQueue) {
         command.useDesiredMovement = false;
         command.useDesiredLookAt = false;
 
+        // 长传/直塞力量：pow指数0.65，曲线比短传更陡，更容易蓄满
         float inputPower = clamp(std::pow(gaugeFactor, 0.65f), 0.01f, 1.0f);
         command.touchInfo.inputDirection = inputDirection;
         command.touchInfo.inputPower = inputPower;
@@ -204,6 +219,7 @@ void HumanController::RequestCommand(PlayerCommandQueue &commandQueue) {
         command.useDesiredMovement = false;
         command.useDesiredLookAt = false;
 
+        // 高球力量：pow指数0.55，曲线最陡，轻按即可打出较远的高球
         float inputPower = clamp(std::pow(gaugeFactor, 0.55f), 0.01f, 1.0f);
         command.touchInfo.inputDirection = inputDirection;
         command.touchInfo.inputPower = inputPower;
@@ -216,6 +232,21 @@ void HumanController::RequestCommand(PlayerCommandQueue &commandQueue) {
       } else if (actionButton == e_ButtonFunction_Shot) {
         DO_VALIDATION;
 
+        // ===== 射门逻辑 =====
+        // 用时间戳计算真实按压时长，避免 ResetNotSticky() 每帧清除按键导致 gauge_ms 永远很小
+        // shotPressStartTime_ms 在 Process() 里按键首次按下时记录，跨环境步不丢失
+        // 按压时长上限 500ms（满蓄），归一化到 [0,1]
+        int shotBaseTime_ms = 60;
+        int shotMaxTime_ms = 500;
+        int effectiveGauge_ms = gauge_ms;
+        if (shotPressStartTime_ms >= 0) {
+          int elapsed = match->GetActualTime_ms() - shotPressStartTime_ms;
+          effectiveGauge_ms = clamp(elapsed, 10, 1000);
+        }
+        float shotGaugeFactor = (effectiveGauge_ms - shotBaseTime_ms) *
+                                (1.0f / float(shotMaxTime_ms - shotBaseTime_ms));
+        shotGaugeFactor = clamp(shotGaugeFactor, 0.0f, 1.0f);
+
         PlayerCommand command;
         command.desiredFunctionType = e_FunctionType_Shot;
         command.useDesiredMovement = false;
@@ -225,9 +256,16 @@ void HumanController::RequestCommand(PlayerCommandQueue &commandQueue) {
         command.touchInfo.autoDirectionBias = GetConfiguration()->GetReal("gameplay_shot_autodirection", _default_Shot_AutoDirection);
         command.touchInfo.autoDirectionBias = 1.0f;
         command.touchInfo.desiredDirection = AI_GetShotDirection(CastPlayer(), command.touchInfo.inputDirection, command.touchInfo.autoDirectionBias);
+        // pow 指数 2.0：曲线上凸，短按力量极弱，需要长按才能打出强力射门
+        // 100ms → dp≈0.008 → ~20 m/s；300ms → dp≈0.30 → ~32 m/s；500ms → dp=1.0 → 60 m/s
         command.touchInfo.desiredPower =
-            clamp(std::pow(gaugeFactor, 0.6f), 0.01f, 1.0f);
+            clamp(std::pow(shotGaugeFactor, 2.0f), 0.01f, 1.0f);
 
+        printf("[SHOT] effectiveGauge_ms=%d  shotGaugeFactor=%.3f  desiredPower=%.3f\n",
+               effectiveGauge_ms, shotGaugeFactor, command.touchInfo.desiredPower);
+
+        // 记录推入时的 gauge（UI 冻结用），每次推入都更新
+        shotQueuedGauge_ms = effectiveGauge_ms;
         commandQueue.push_back(command);
       }
     }
@@ -537,6 +575,9 @@ void HumanController::Process() {
         DO_VALIDATION;
         actionMode = 2;
         actionButton = e_ButtonFunction_Shot;
+        // 记录射门按键按下的游戏时间，用于跨环境步计算实际按压时长
+        // ResetNotSticky() 每个环境步结束后会清除按键状态，但我们保留时间戳
+        shotPressStartTime_ms = match->GetActualTime_ms();
       }
     }
   }
@@ -545,11 +586,18 @@ void HumanController::Process() {
     DO_VALIDATION;
     if (hid->GetButton(actionButton)) {
       DO_VALIDATION;
+      // 每帧（10ms）增加蓄力时间，上限 1000ms（满力）
       gauge_ms += 10;
       gauge_ms = clamp(gauge_ms, 10, 1000);
+      // 射门按键：同步更新基于游戏时间的实际按压时长（覆盖物理步累积值）
+      // GetActualTime_ms() 跨越环境步边界不会重置，可以准确计量持续时间
+      if (actionButton == e_ButtonFunction_Shot && shotPressStartTime_ms >= 0) {
+        int elapsed = match->GetActualTime_ms() - shotPressStartTime_ms;
+        gauge_ms = clamp(elapsed, 10, 1000);
+      }
       actionBufferTime_ms = 0;
     } else {
-      // button released, stay in this actionMode until actionBufferTime_ms becomes too big
+      // 按键已松开：保持 actionMode=2 直到缓冲超时，等待执行动作
       actionBufferTime_ms += 10;
     }
   }
@@ -582,6 +630,8 @@ void HumanController::Reset() {
   gauge_ms = 0;
   actionButton = e_ButtonFunction_ShortPass;
   actionBufferTime_ms = 0;
+  shotPressStartTime_ms = -1;
+  shotQueuedGauge_ms = -1;
 
   lastSwitchTime_ms = -10000;
   lastSwitchTimeDuration_ms = 300;
