@@ -24,6 +24,10 @@ cmake_install.cmake
 *.pyd
 *.cbp
 
+# Root-level gfootball_engine copy (created by setup.py Windows fallback when
+# symlinks are unavailable; only contains __init__.py + data + compiled libs)
+gfootball_engine/
+
 # IDE
 .idea
 .vs*

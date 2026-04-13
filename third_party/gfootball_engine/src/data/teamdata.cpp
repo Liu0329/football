@@ -252,6 +252,12 @@ TeamData::TeamData(int teamDatabaseID, const std::vector<FormationEntry> &f) {
       DO_VALIDATION;
       formation[x].start_position = formation[x].position;
     } else {
+      // 自定义场景（f 非空）：从场景配置拷贝初始位置和属性。
+      // position 保留由 XML 默认阵型计算出的值，供 AI 阵型定位使用；
+      // start_position 存放 Python 场景里 AddPlayer(x, y) 给出的出生坐标，
+      // 供 Player::Activate 里的 ResetPosition 调用。
+      // 注意：坐标约定是"己方球门 = x=-1"，引擎在 Activate 时统一乘以
+      //       -GetDynamicSide() 完成镜像（右队 side=1 → 坐标取反到右侧）。
       formation[x].start_position = f[x].start_position;
       formation[x].lazy = f[x].lazy;
       formation[x].role = f[x].role;

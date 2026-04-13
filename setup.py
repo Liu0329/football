@@ -112,6 +112,11 @@ class CustomBuild(build_ext):
     lib_path = 'third_party/gfootball_engine/build_win/Release/'
     libs = glob.glob(f'{lib_path}*.pyd') + glob.glob(f'{lib_path}*.dll')
     copy_compiled_libs(libs, dest_dir)
+    copy_compiled_libs(libs, 'third_party/gfootball_engine')
+    # Also copy into the root-level 'gfootball_engine' directory that Python
+    # actually imports from when symlinks are unavailable (Windows fallback).
+    if os.path.isdir('gfootball_engine'):
+      copy_compiled_libs(libs, 'gfootball_engine')
     copy_fonts(dest_dir)
 
 

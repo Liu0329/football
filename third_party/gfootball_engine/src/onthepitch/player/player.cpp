@@ -105,6 +105,12 @@ void Player::Activate(boost::intrusive_ptr<Node> humanoidSourceNode,
   CastController()->SetPlayer(this);
   buf_nameCaptionShowCondition = false;
   nameCaption->Show();
+  // 将 FormationEntry 的归一化坐标（[-1,1]）转换为引擎世界坐标并设置出生点。
+  // × 25：归一化 → 世界坐标缩放（球场半长约 52m，归一化后为 ±1）。
+  // × Vector3(-side, -side, 0)：坐标系镜像。
+  //   所有队伍的阵型坐标均以"己方球门 = x=-1"为基准书写，
+  //   左队 side=-1 → -side=1，坐标不变；
+  //   右队 side= 1 → -side=-1，x/y 取反，把左基准坐标翻转到右侧。
   CastHumanoid()->ResetPosition(
       GetFormationEntry().position * 25 *
           Vector3(-team->GetDynamicSide(), -team->GetDynamicSide(), 0),
