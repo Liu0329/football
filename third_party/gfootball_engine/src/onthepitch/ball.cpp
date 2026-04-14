@@ -35,16 +35,16 @@ constexpr float bounce = 0.62f;
 constexpr float linearBounce = 0.06f;
 
 // 空气阻力系数（二次项）：F_drag = drag * v^2，对快速飞行的球影响较大
-// 0.015 → 约 60m/s 球每秒损失约 54m/s 的速度（纯空气阻力）
-constexpr float drag = 0.015f;
+// 0.006 → 60m/s 球每秒损失约 21.6m/s 的速度，爆射能保持更长的高速飞行
+constexpr float drag = 0.006f;
 
 // 草地摩擦力系数（二次项，滚动时）：F_fric = friction * v^2
-// 数值越大，球在地面减速越快；原值 0.04，调小可让地滚球滑得更远
-constexpr float friction = 0.025f;  // 原值 0.04，减小以降低草地摩擦
+// 数值越大，球在地面减速越快
+constexpr float friction = 0.04f;  // 原始值
 
 // 草地线性摩擦力（一次项）：每秒固定减速量（m/s），负责让球最终完全停下
-// 数值越大，球停得越快；原值 1.6，调小可让低速球继续滚动更长时间
-constexpr float linearFriction = 0.9f;  // 原值 1.6，减小以降低线性摩擦
+// 数值越大，球停得越快
+constexpr float linearFriction = 1.6f;  // 原始值
 
 // 重力加速度（m/s²），标准值 9.81
 constexpr float gravity = -9.81f;
@@ -111,6 +111,11 @@ void Ball::Touch(const Vector3 &target) {
   if (positionBuffer.coords[2] < 0.11f) positionBuffer.coords[2] = 0.11f;
 
   SetMomentum(target);
+
+  // 记录发射状态，用于动态重力计算
+  launchSpeed = target.GetLength();
+  flightTime_sec = 0.0f;
+  inFlight = (launchSpeed > 15.0f && target.coords[2] > 0.5f);
 
   // recalculate prediction
   CalculatePrediction();
@@ -195,16 +200,31 @@ BallSpatialInfo Ball::CalculatePrediction() {
 
     float frictionFactor = 0.0f;
 
+    // ===== 动态重力系统 =====
+    // 高速射门时重力大幅减小（炮弹直线效果），随飞行时间恢复到标准值
+    // launchSpeed > 30 m/s 时 gravity_multiplier 从 0.2 开始，2 秒内恢复到 1.0
+    // launchSpeed <= 30 m/s 时不缩减（普通传球/低速球保持自然弧线）
+    float gravity_multiplier = 1.0f;
+    if (inFlight && launchSpeed > 30.0f) {
+      float speedFactor = clamp((launchSpeed - 30.0f) / 30.0f, 0.0f, 1.0f);
+      float minGravity = 0.2f + (1.0f - speedFactor) * 0.3f;  // 60m/s → 0.2, 30m/s → 0.5
+      float timeRatio = clamp(flightTime_sec / 2.0f, 0.0f, 1.0f);
+      gravity_multiplier = minGravity + (1.0f - minGravity) * timeRatio;
+    }
+    momentumPredict.coords[2] = momentumPredict.coords[2] + gravity * gravity_multiplier * timeStep;
+    flightTime_sec += timeStep;
 
-    // 重力：每帧对垂直速度积分，vz += g * dt
-    momentumPredict.coords[2] = momentumPredict.coords[2] + gravity * timeStep;
+    // 落地时结束飞行状态
+    if (nextPos.coords[2] <= 0.12f && momentumPredict.coords[2] <= 0.0f) {
+      inFlight = false;
+    }
 
-
-    // 空气阻力（二次项）：Δv = -drag * v² * dt，速度越快阻力越大
-    // 对地滚球影响很小（v低），主要影响射门后的高速飞球
+    // 空气阻力：轻微线性衰减 + 二次项
+    // 二次项 drag=0.006 负责高速减速，线性项 0.995 负责视觉层次感
     float momentumVelo = momentumPredict.GetLength();
     float momentumVeloDragged =
         momentumVelo - drag * std::pow(momentumVelo, 2.0f) * timeStep;
+    momentumVeloDragged *= 0.9997f;  // 每 10ms 微衰减，模拟空气粘滞
     if (drag_enabled) momentumPredict = momentumPredict.GetNormalized(0) * momentumVeloDragged;
 
 
@@ -617,6 +637,9 @@ void Ball::ResetSituation(const Vector3 &focusPos) {
   valid_predictions = 0;
   orientationBuffer = QUATERNION_IDENTITY;
   ballTouchesNet = false;
+  flightTime_sec = 0.0f;
+  launchSpeed = 0.0f;
+  inFlight = false;
 }
 
 void Ball::ProcessState(EnvState *state) {
@@ -638,4 +661,7 @@ void Ball::ProcessState(EnvState *state) {
   state->process(positionBuffer);
   state->process(orientationBuffer);
   state->process(ballTouchesNet);
+  state->process(flightTime_sec);
+  state->process(launchSpeed);
+  state->process(inFlight);
 }

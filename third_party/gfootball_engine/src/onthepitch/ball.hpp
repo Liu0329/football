@@ -91,6 +91,11 @@ class Ball {
 
     bool ballTouchesNet = false;
 
+    // 动态重力系统：高速射门时重力减小，随飞行时间恢复
+    float flightTime_sec = 0.0f;       // 自上次被踢出后的飞行时间
+    float launchSpeed = 0.0f;          // 被踢出时的初始速度（m/s）
+    bool inFlight = false;             // 球是否在飞行中（离地+高速）
+
 };
 
 #endif

@@ -30,6 +30,21 @@ class Controller(player_base.PlayerBase):
     self._last_direction = football_action_set.action_idle
     self._current_direction = football_action_set.action_idle
 
+  # C++ 的 ResetNotSticky 每帧清除 pass/shot，所以按住时需要每帧重发。
+  # sprint/dribble/pressure 等不被 ResetNotSticky 清除，不需要重发。
+  _STICKY_SEND_ACTIONS = None
+
+  @classmethod
+  def _get_sticky_actions(cls):
+    if cls._STICKY_SEND_ACTIONS is None:
+      cls._STICKY_SEND_ACTIONS = {
+          football_action_set.action_shot,
+          football_action_set.action_short_pass,
+          football_action_set.action_long_pass,
+          football_action_set.action_high_pass,
+      }
+    return cls._STICKY_SEND_ACTIONS
+
   def _check_action(self, action, active_actions):
     """Compare (and update) controller's state with the set of active actions.
 
@@ -41,6 +56,14 @@ class Controller(player_base.PlayerBase):
     if not action.is_in_actionset(self._env_config):
       return
     state = active_actions.get(action, 0)
+    # pass/shot 被 ResetNotSticky 每帧清除，按住时需要每帧重发。
+    # 只在 last_action==idle 时才占用（不阻塞同帧其他 release）。
+    if action in self._get_sticky_actions() and state:
+      if self._last_action == football_action_set.action_idle:
+        self._active_actions[action] = state
+        self._last_action = action
+      return
+    # 其他按键：只在状态变化时发送（按下/松开各一次）
     if (self._last_action == football_action_set.action_idle and
         self._active_actions.get(action, 0) != state):
       self._active_actions[action] = state
@@ -93,6 +116,21 @@ class Controller(player_base.PlayerBase):
       else:
         return self._current_direction
     self._last_action = football_action_set.action_idle
+    # sprint/dribble 的 release 优先：它们在 C++ 里是 sticky（不被 ResetNotSticky 清除），
+    # 如果 release 被 pass sticky 吞掉，C++ 就永远以为 sprint 按着 → 锁死。
+    # 先检查它们的 release，再检查其他 action。
+    for act in [football_action_set.action_sprint,
+                football_action_set.action_dribble,
+                football_action_set.action_pressure,
+                football_action_set.action_team_pressure,
+                football_action_set.action_keeper_rush]:
+      if not act.is_in_actionset(self._env_config):
+        continue
+      s = active_actions.get(act, 0)
+      if not s and self._active_actions.get(act, 0):
+        self._active_actions[act] = 0
+        self._last_action = football_action_set.disable_action(act)
+        return self._last_action
     self._check_action(football_action_set.action_long_pass,
                        active_actions)
     self._check_action(football_action_set.action_high_pass,

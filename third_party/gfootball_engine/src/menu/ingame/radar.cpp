@@ -229,10 +229,9 @@ void Gui2Radar::Put() {
 
       if (btn == e_ButtonFunction_Shot) {
         displayGauge_ms = getPassGauge(hc->GetShotQueuedGauge_ms());
-        // 射门：[60,500]ms，指数 2.0，球速 20~60 m/s
+        // 射门：[60,500]ms，线性，球速 30~60 m/s
         float gf = clamp((displayGauge_ms - 60) * (1.0f / 440.0f), 0.0f, 1.0f);
-        float dp = std::pow(gf, 2.0f);
-        displayPower = std::max(0.0f, std::min(1.0f, (20.0f + dp * 40.0f) / 60.0f));
+        displayPower = std::max(0.0f, std::min(1.0f, (30.0f + gf * 30.0f) / 60.0f));
         colorR = (int)std::min(255.0f, 50 + 150 * displayPower);
         colorG = (int)std::min(255.0f, 180 + 50 * displayPower);
         colorB = 20;
@@ -241,25 +240,33 @@ void Gui2Radar::Put() {
 
       } else if (btn == e_ButtonFunction_ShortPass) {
         displayGauge_ms = getPassGauge(hc->GetPassQueuedGauge_ms());
-        // 短传：线性显示 gaugeFactor，代表"在最近～最远队友之间选了多远"
+        // 短传：显示实际球速比例
+        // gaugeFactor → targetDist=4+gf*26 → desiredPower=pow(dist/60,1.0)*0.9
+        // 球速 = 36*(desiredPower+0.3)，范围约 13~27 m/s，以 30 m/s 为满格
         float gf = clamp((displayGauge_ms - 60) * (1.0f / 940.0f), 0.0f, 1.0f);
-        displayPower = gf;
+        float targetDist = 4.0f + gf * 26.0f;
+        float dp = std::pow(targetDist / 60.0f, 1.0f) * 0.9f;
+        float speed = 36.0f * (dp + 0.3f);
+        displayPower = clamp(speed / 30.0f, 0.0f, 1.0f);
         colorR = 20; colorG = (int)std::min(255.0f, 100 + 100 * displayPower); colorB = 220;
         isActive = true;
         break;
 
       } else if (btn == e_ButtonFunction_LongPass) {
         displayGauge_ms = getPassGauge(hc->GetPassQueuedGauge_ms());
-        // 长传：线性
+        // 直塞：显示实际球速比例，范围约 13~27 m/s，以 30 m/s 为满格
         float gf = clamp((displayGauge_ms - 60) * (1.0f / 940.0f), 0.0f, 1.0f);
-        displayPower = gf;
+        float targetDist = 6.0f + gf * 24.0f;
+        float dp = std::pow(targetDist / 60.0f, 1.0f) * 0.9f;
+        float speed = 36.0f * (dp + 0.3f);
+        displayPower = clamp(speed / 30.0f, 0.0f, 1.0f);
         colorR = 220; colorG = (int)std::min(255.0f, 120 + 80 * displayPower); colorB = 20;
         isActive = true;
         break;
 
       } else if (btn == e_ButtonFunction_HighPass) {
         displayGauge_ms = getPassGauge(hc->GetPassQueuedGauge_ms());
-        // 高传：线性
+        // 高传：线性显示距离比例（6~100m），以 100m 为满格
         float gf = clamp((displayGauge_ms - 60) * (1.0f / 940.0f), 0.0f, 1.0f);
         displayPower = gf;
         colorR = 20; colorG = (int)std::min(255.0f, 200 + 55 * displayPower); colorB = (int)std::min(255.0f, 180 + 75 * displayPower);

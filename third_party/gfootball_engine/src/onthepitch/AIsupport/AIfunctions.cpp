@@ -1043,23 +1043,27 @@ void AI_GetAutoPass(e_FunctionType passType, const Vector3 &vector,
                     Vector3 &resultingDirection, float &resultingPower) {
   DO_VALIDATION;
   float heightOffset = 0.11f;
-  float powerFactor = 1.8f;//1.6f
+  float powerFactor = 1.8f;
   float distanceExp = 1.4f;
   if (passType == e_FunctionType_HighPass) {
     DO_VALIDATION;
-    // 扩展距离上限到 100m（原来 60m 导致超过 60m 的高传球速封顶，无法真正踢远）
-    // heightOffset 随距离从 0.45（近）降到 0.30（远），距离越远弧线越平
     heightOffset = 0.45f - NormalizedClamp(vector.GetLength(), 0.0f, 100.0f) * 0.15f;
     powerFactor = 1.15f;
     distanceExp = 1.4f;
-  } else if (passType == e_FunctionType_ShortPass) {
+  } else if (passType == e_FunctionType_ShortPass ||
+             passType == e_FunctionType_LongPass) {
     DO_VALIDATION;
-    // 短传：完全贴地，球离地高度不超过 0.1m
-    // heightOffset 接近 0 → 出球方向几乎水平，球在草地上滚动
+    // 短传/直塞：贴地滚动
+    // distanceExp=1.0（线性），powerFactor=0.9
+    // 球速 = 36 × (pow(dist/60,1.0)×0.9 + 0.3)
+    //   4m  → desiredPower=0.060 → 球速=36×0.36=13 m/s（短按，合理）
+    //  15m  → desiredPower=0.225 → 球速=36×0.53=19 m/s
+    //  30m  → desiredPower=0.450 → 球速=36×0.75=27 m/s（长按，不太快）
     heightOffset = 0.01f;
+    distanceExp = 1.0f;
+    powerFactor = 0.9f;
   }
   resultingDirection = (vector.GetNormalized(0) + Vector3(0, 0, heightOffset)).GetNormalized(0);
-  // 高传用 100m 上限（原 60m 导致超过 60m 的高传球速封顶），其他传球保持 60m
   float distanceMax = (passType == e_FunctionType_HighPass) ? 100.0f : 60.0f;
   resultingPower =
       std::pow(NormalizedClamp(vector.GetLength(), 0.0f, distanceMax), distanceExp) *

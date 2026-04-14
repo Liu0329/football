@@ -212,46 +212,80 @@ void HumanController::RequestCommand(PlayerCommandQueue &commandQueue) {
         passQueuedGauge_ms = effectivePress_ms;
         commandQueue.push_back(command);
 
-      } else if (actionButton == e_ButtonFunction_ShortPass ||
-                 actionButton == e_ButtonFunction_LongPass) {
+      } else if (actionButton == e_ButtonFunction_ShortPass) {
         DO_VALIDATION;
 
-        // ===== 短传/长传：与高传完全相同的纯手动逻辑 =====
-        // 完全绕过 AI_GetPass，直接调用 AI_GetAutoPass：
-        //   - 方向：100% 等于玩家输入方向，不找任何队友
-        //   - 距离：gaugeFactor 线性映射到 [minDist, maxDist]
-        //   - 球速：由 AI_GetAutoPass 根据距离计算
-        // 短传 (S)：4m ~ 30m，贴地滚动（heightOffset≈0）
-        // 长传 (W)：6m ~ 60m，稍微弹起（heightOffset=0.11）
+        // ===== 短传 (S)：纯手动，贴地滚动 =====
+        // 方向 = 玩家输入，距离 = gaugeFactor 线性映射到 4~30m
         {
-          float minDist, maxDist;
-          e_FunctionType funcType;
-          if (actionButton == e_ButtonFunction_ShortPass) {
-            minDist  = 4.0f;
-            maxDist  = 30.0f;
-            funcType = e_FunctionType_ShortPass;
-          } else {
-            minDist  = 6.0f;
-            maxDist  = 60.0f;
-            funcType = e_FunctionType_LongPass;
-          }
-
-          float targetDist = minDist + gaugeFactor * (maxDist - minDist);
+          float targetDist = 4.0f + gaugeFactor * 26.0f;
           Vector3 targetVec = inputDirection * targetDist;
 
           PlayerCommand command;
-          command.desiredFunctionType = funcType;
+          command.desiredFunctionType = e_FunctionType_ShortPass;
           command.useDesiredMovement = false;
           command.useDesiredLookAt = false;
           command.touchInfo.inputDirection = inputDirection;
           command.touchInfo.inputPower = clamp(targetDist / 60.0f, 0.01f, 2.0f);
           command.touchInfo.targetPlayer = nullptr;
-          AI_GetAutoPass(funcType, targetVec,
+          AI_GetAutoPass(e_FunctionType_ShortPass, targetVec,
                          command.touchInfo.desiredDirection, command.touchInfo.desiredPower);
 
-          printf("[%s] gaugeFactor=%.3f targetDist=%.1fm desiredPower=%.3f\n",
-                 (actionButton == e_ButtonFunction_ShortPass) ? "ShortPass" : "LongPass",
+          printf("[ShortPass] gaugeFactor=%.3f targetDist=%.1fm desiredPower=%.3f\n",
                  gaugeFactor, targetDist, command.touchInfo.desiredPower);
+
+          passQueuedGauge_ms = effectivePress_ms;
+          commandQueue.push_back(command);
+        }
+
+      } else if (actionButton == e_ButtonFunction_LongPass) {
+        DO_VALIDATION;
+
+        // ===== 直塞 (W)：纯手动 + 前插偏移 =====
+        // 方向=玩家输入，距离=gaugeFactor 线性映射到 6~30m，贴地（heightOffset≈0）
+        // 额外：落点沿进攻方向加一个前插偏移（1~3m），根据前方空旷度自动调整：
+        //   - 空旷（无对手）→ 3m，球传到跑动空间里
+        //   - 拥挤（有对手）→ 1m，保守传到脚边
+        // 安全限制：前插偏移方向与玩家输入方向的点积必须 >= 0，
+        //   避免出现"玩家往前传、偏移把球拉到反方向"的情况
+        {
+          float targetDist = 6.0f + gaugeFactor * 24.0f;  // 6~30m
+
+          // 对方球门方向（单位向量）：side=-1 表示向 x 负方向进攻
+          float side = (float)team->GetDynamicSide();
+          Vector3 forwardDir = Vector3(-side, 0, 0);
+
+          // 基础落点
+          Vector3 baseLandPos = player->GetPosition() + inputDirection * targetDist;
+
+          // 检测基础落点前方（沿进攻方向 3m 处）的空旷度
+          Vector3 checkPos = baseLandPos + forwardDir * 3.0f;
+          float freeSpace = AI_CalculateFreeSpace(match, _mentalImage, team->GetID(),
+                                                  checkPos, 5.0f, 0.6f);
+
+          // 偏移量：1m（拥挤）~ 3m（空旷）
+          float forwardOffset = 1.0f + freeSpace * 2.0f;
+
+          // 安全检查：若进攻方向与玩家输入方向反向（点积 < 0），则不加偏移
+          // 防止玩家回传时球被意外推向前方
+          float dot = forwardDir.GetDotProduct(inputDirection);
+          if (dot < 0.0f) forwardOffset = 0.0f;
+
+          // 最终目标点 = 基础落点 + 前插偏移
+          Vector3 targetVec = (baseLandPos + forwardDir * forwardOffset) - player->GetPosition();
+
+          PlayerCommand command;
+          command.desiredFunctionType = e_FunctionType_LongPass;
+          command.useDesiredMovement = false;
+          command.useDesiredLookAt = false;
+          command.touchInfo.inputDirection = inputDirection;
+          command.touchInfo.inputPower = clamp(targetDist / 60.0f, 0.01f, 2.0f);
+          command.touchInfo.targetPlayer = nullptr;
+          AI_GetAutoPass(e_FunctionType_LongPass, targetVec,
+                         command.touchInfo.desiredDirection, command.touchInfo.desiredPower);
+
+          printf("[LongPass] gaugeFactor=%.3f targetDist=%.1fm freeSpace=%.2f dot=%.2f offset=%.1fm desiredPower=%.3f\n",
+                 gaugeFactor, targetDist, freeSpace, dot, forwardOffset, command.touchInfo.desiredPower);
 
           passQueuedGauge_ms = effectivePress_ms;
           commandQueue.push_back(command);
@@ -281,13 +315,15 @@ void HumanController::RequestCommand(PlayerCommandQueue &commandQueue) {
         command.useDesiredLookAt = false;
         command.desiredVelocityFloat = inputVelocityFloat; // this is so we can use sprint/dribble buttons as shot modifiers
         command.touchInfo.inputDirection = inputDirection;
-        command.touchInfo.autoDirectionBias = GetConfiguration()->GetReal("gameplay_shot_autodirection", _default_Shot_AutoDirection);
         command.touchInfo.autoDirectionBias = 1.0f;
+        // AI_GetShotDirection：上下键的 y 分量 → 球门左右侧偏移（已有逻辑）
         command.touchInfo.desiredDirection = AI_GetShotDirection(CastPlayer(), command.touchInfo.inputDirection, command.touchInfo.autoDirectionBias);
-        // pow 指数 2.0：曲线上凸，短按力量极弱，需要长按才能打出强力射门
-        // 100ms → dp≈0.008 → ~20 m/s；300ms → dp≈0.30 → ~32 m/s；500ms → dp=1.0 → 60 m/s
-        command.touchInfo.desiredPower =
-            clamp(std::pow(shotGaugeFactor, 2.0f), 0.01f, 1.0f);
+
+        // 力量决定高度：desiredPower 越大，球飞得越高
+        // desiredPower 存入 desiredDirection.coords[2]，GetShotVector 读取
+        // 力量线性：按键时长正比于力量，消除 pow 指数曲线导致的中间卡顿
+        command.touchInfo.desiredPower = clamp(shotGaugeFactor, 0.01f, 1.0f);
+        command.touchInfo.desiredDirection.coords[2] = command.touchInfo.desiredPower;
 
         printf("[SHOT] effectiveGauge_ms=%d  shotGaugeFactor=%.3f  desiredPower=%.3f\n",
                effectiveGauge_ms, shotGaugeFactor, command.touchInfo.desiredPower);

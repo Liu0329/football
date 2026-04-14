@@ -421,19 +421,22 @@ Vector3 GetShotVector(Match *match, Player *player, const Vector3 &nextStartPos,
                       (0.7f + playerDirDesiredDirPowerFactor * 0.3f) *
                       (0.7f + playerVelocityPowerFactor * 0.3f) *
                       (0.4f + positionOffsetPowerFactor * 0.6f);
-  powerFactor = clamp(powerFactor, 0.0f, 1.0f);
+  // 下限 0.7：确保任何姿势/方向的射门都能打出至少 70% 的期望球速，
+  // 避免侧射或静止射门时力量被过度削减（原来最低可到 ~0.28）
+  powerFactor = clamp(powerFactor, 0.7f, 1.0f);
 
-  // 射门基础球速：线性映射 desiredPower [0,1] → 球速 [20, 60] m/s
-  // 短按(desiredPower≈0) → 20 m/s；长按(desiredPower=1) → 60 m/s
-  // 力量槽显示比例 = adaptedDesiredPower / 60，与此公式完全一致
+  // 射门基础球速：线性映射 desiredPower [0,1] → 球速 [30, 60] m/s
+  // 短按(desiredPower≈0) → 30 m/s；长按(desiredPower=1) → 60 m/s
   float adaptedDesiredPower =
-      20.0f + currentAnim.originatingCommand.touchInfo.desiredPower * 40.0f;
+      30.0f + currentAnim.originatingCommand.touchInfo.desiredPower * 30.0f;
 
-  float animMaxPowerFactor = atof(currentAnim.anim->GetVariable("touch_maxpowerfactor").c_str());
-  if (animMaxPowerFactor == 0.0f) animMaxPowerFactor = 1.0f;
+  // animMaxPowerFactor 原本限制不同动画的最大出力（头球/侧转天生弱）
+  // 对手动控制场景意义不大：玩家按键时长已决定力量，不应被动画文件随机削减
+  // 固定为 1.0，让上限只由球员属性决定
+  float animMaxPowerFactor = 1.0f;
 
-  // 上限：满属性(physical_shotpower=1)满动画 = (43+17) * 1.0 = 60 m/s
-  float power = clamp(powerFactor * adaptedDesiredPower, 0.0f, (43.0f + player->GetStat(physical_shotpower) * 17.0f) * (0.2f + animMaxPowerFactor * 0.8f));
+  // 上限：满属性(physical_shotpower=1) = (43+17) * 1.0 = 60 m/s
+  float power = clamp(powerFactor * adaptedDesiredPower, 0.0f, 43.0f + player->GetStat(physical_shotpower) * 17.0f);
 
   printf("[GetShotVector] desiredPower=%.3f  adaptedDesiredPower=%.2f  powerFactor=%.3f  power_before_mov=%.2f  animMaxPowerFactor=%.3f  shotpower_stat=%.3f\n",
          currentAnim.originatingCommand.touchInfo.desiredPower,
@@ -473,7 +476,18 @@ Vector3 GetShotVector(Match *match, Player *player, const Vector3 &nextStartPos,
 
   // best case result
 
-  float desiredHeight = 0.05f;
+  // 出球高度由力量决定，80% 力量以下几乎贴地（抽射效果）
+  // dp < 0.8 → desiredHeight ≈ 0.02~0.04（贴地抽射）
+  // dp 0.8~1.0 → desiredHeight 快速升到 0.30（满力飞向球门上方）
+  float dp = currentAnim.originatingCommand.touchInfo.desiredPower;
+  float desiredHeight;
+  if (dp < 0.8f) {
+    desiredHeight = 0.02f + dp * 0.025f;  // 0.02 ~ 0.04，基本贴地
+  } else {
+    // 0.8~1.0 快速上升：0.04 → 0.30
+    float t = (dp - 0.8f) / 0.2f;  // 0~1
+    desiredHeight = 0.04f + t * t * 0.26f;  // 指数上升
+  }
   Vector3 desiredShot = (currentAnim.originatingCommand.touchInfo.desiredDirection.Get2D() + Vector3(0, 0, desiredHeight)).GetNormalized() * power;
 
   // worst case result
@@ -507,6 +521,16 @@ Vector3 GetShotVector(Match *match, Player *player, const Vector3 &nextStartPos,
   Vector3 shot = desiredShot * (1.0f - worstCaseFactor) +
                  worstCaseShot * worstCaseFactor;
 
+  // 向上初速度补偿：只有接近满力射门时才给向上分量
+  // 球速 > 50 m/s 时生效，最多补偿 2 m/s，配合动态重力呈现炮弹效果
+  // 中低力量不触发，保持贴地抽射感
+  {
+    float shotSpeed = shot.GetLength();
+    if (shotSpeed > 50.0f) {
+      float boostFactor = clamp((shotSpeed - 50.0f) / 10.0f, 0.0f, 1.0f);
+      shot.coords[2] += boostFactor * 2.0f;
+    }
+  }
 
   // add a little curve
 
