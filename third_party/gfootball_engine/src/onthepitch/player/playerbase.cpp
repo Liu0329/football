@@ -100,6 +100,7 @@ void PlayerBase::Process() {
   if (isActive) {
     DO_VALIDATION;
     if (ExternalControllerActive()) externalController->GetHumanController()->Process(); else controller->Process();
+    // Animation timeline + clip selection (see Humanoid / HumanoidBase::Process).
     humanoid->Process();
   } else {
     if (humanoid) humanoid->Hide();

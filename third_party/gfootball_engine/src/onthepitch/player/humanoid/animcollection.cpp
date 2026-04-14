@@ -367,9 +367,13 @@ void GenerateAutoAnims(const std::vector<Animation *> &templates,
   }
 }
 
+// Loads every clip used in-match: template-based auto transitions, then all
+// media/animations/*.anim (except luxury/templates paths). Each Animation is
+// bound to the shared player.object skeleton (nodeMap) via _PrepareAnim;
+// runtime instances clone this rig for their own nodeMap.
 void AnimCollection::Load() {
   DO_VALIDATION;
-  // load utility player to get things like foot position in the frames around the balltouch etc.
+  // Reference rig for preprocessing: foot contacts, mirroring, _PrepareAnim.
 
   ObjectLoader loader;
   boost::intrusive_ptr<Node> playerNode;
@@ -416,6 +420,7 @@ void AnimCollection::Load() {
   }
   templates.clear();
 
+  // Register each generated transition twice: mirrored and unmirrored.
   for (unsigned int i = 0; i < autoAnims.size(); i++) {
     DO_VALIDATION;
     Animation *animation = new Animation(*autoAnims[i]);
@@ -430,7 +435,7 @@ void AnimCollection::Load() {
     _PrepareAnim(animation, playerNode, bodyParts, nodeMap, false);
   }
 
-  // load all other animations
+  // Hand-authored clips under media/animations (mirrored + original).
 
   files.clear();
   GetFiles("media/animations", "anim", files);

@@ -82,6 +82,8 @@ bool _PassFiddlingEnabled() {
   return true;
 }
 
+// Field player: same playback pipeline as HumanoidBase::Process but with
+// command/mental-image logic; animApplyBuffer is still consumed in FetchPutBuffers.
 void Humanoid::Process() {
   DO_VALIDATION;
   auto currentMentalImage = match->GetMentalImage(mentalImageTime);
@@ -2225,9 +2227,14 @@ Vector3 Humanoid::CalculateMovementSmuggle(const Vector3 &desiredDirection,
   return toDesired;
 }
 
+// 获取实际可施加的最佳触球力量向量（含上限限制和误差扰动）
+// desiredTouch：期望的触球速度向量（m/s），由上层蓄力/AI计算得出
+// 返回值：实际触球向量，经过上限裁剪、难度扰动等处理
 Vector3 Humanoid::GetBestPossibleTouch(const Vector3 &desiredTouch,
                                        e_FunctionType functionType) {
   DO_VALIDATION;
+  // 球速上限（单位 m/s）：短传/射门约 30 m/s，高球约 42 m/s
+  // 这是物理上的最大球速限制，玩家无论按多久按键都无法超过此值
   constexpr float maxPowerShortPass = 30.0f;
   constexpr float maxPowerHighPass  = 42.0f;
   float maxPowerBase = maxPowerShortPass;
@@ -2235,19 +2242,20 @@ Vector3 Humanoid::GetBestPossibleTouch(const Vector3 &desiredTouch,
 
   Vector3 resultTouch = desiredTouch;
 
-  // fetch vars
-
+  // 从动画元数据中读取该动画的最大力量系数（不同踢球动作有不同上限）
   float maxPowerFactor = atof(currentAnim.anim->GetVariable("touch_maxpowerfactor").c_str());
   if (maxPowerFactor == 0.0f) maxPowerFactor = 1.0f;
+  // 动画系数缩放：确保即使系数较小，仍有30%的基础能力
   maxPowerFactor = maxPowerFactor * 0.7f + 0.3f;
 
 
-  // clamp to maximum possible power (from anim vars)
-
+  // 最终上限 = 基础上限 × 动画系数 × 位置偏移惩罚 + 借助球本身动量的加成
+  // decayingPositionOffset：球员身体与理想触球点的偏移，越大则力量损失越多
   float maxPower = maxPowerBase * maxPowerFactor * (1.0f - clamp(decayingPositionOffset.GetLength() * 2.5f, 0.0f, 0.25f));
   maxPower += match->GetBall()->GetMovement().GetLength() * 0.5f; // can use some of current ballmomentum
   if (resultTouch.GetLength() > maxPower) {
     DO_VALIDATION;
+    // 超出上限：将多余力量转化为向上分量（球飞高一些，而非更快）
     float missingPower = resultTouch.GetLength() - maxPower;
     resultTouch = resultTouch.GetNormalized(0) * maxPower;
     resultTouch.coords[2] += clamp(missingPower, 0.0f, 10.0f) * 0.25f;

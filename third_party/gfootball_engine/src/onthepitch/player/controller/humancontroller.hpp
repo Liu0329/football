@@ -68,6 +68,10 @@ class HumanController : public PlayerController {
     int GetShotPressStartTime_ms() const { return shotPressStartTime_ms; }
     // 返回射门命令推入时的冻结 gauge（ms），-1 表示尚未推入（仍在蓄力中）
     int GetShotQueuedGauge_ms() const { return shotQueuedGauge_ms; }
+    // 返回传球命令推入时的冻结 gauge（ms），-1 表示尚未推入（仍在蓄力中）
+    int GetPassQueuedGauge_ms() const { return passQueuedGauge_ms; }
+    // 返回当前蓄力中的传球 gauge（ms），用于蓄力阶段 UI 显示
+    int GetGaugeFactor_ms() const { return gauge_ms; }
     // 返回当前动作按键类型，用于判断是否是射门蓄力
     e_ButtonFunction GetActionButton() const { return actionButton; }
 
@@ -92,6 +96,8 @@ class HumanController : public PlayerController {
     // 射门命令推入队列时的 gauge 快照（ms），-1 表示尚未推入
     // 推入后力量槽冻结在此值，不再随时间增长
     int shotQueuedGauge_ms = -1;
+    // 传球（短传/长传/高球）命令推入时的 gauge 快照（ms），-1 表示未推入
+    int passQueuedGauge_ms = -1;
 
     // stuff to keep track of analog stick (or keys even) so that we can use a direction once it's been pointed in for a while, instead of directly
     Vector3 previousDirection;

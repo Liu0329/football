@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.4)
+cmake_minimum_required(VERSION 3.15)
 
 if(WIN32)
   # Check for required Environment variables
@@ -13,7 +13,7 @@ if(WIN32)
   if(${CMAKE_GENERATOR_PLATFORM} STREQUAL Win32)
     set(VCPKG_TARGET_TRIPLET "x86-windows")
   elseif(${CMAKE_GENERATOR_PLATFORM} STREQUAL x64)
-    set(VCPKG_TARGET_TRIPLET "x64-windows")
+    set(VCPKG_TARGET_TRIPLET "x64-windows-release")
   else()
     message(FATAL_ERROR "Unsupported Generator Platform, only Win32 or x64 are supported")
   endif()
@@ -52,9 +52,9 @@ if(UNIX AND NOT APPLE)
 endif()
 
 if(WIN32)
-  FIND_PACKAGE(SDL2-image REQUIRED)
-  FIND_PACKAGE(SDL2-ttf REQUIRED)
-  FIND_PACKAGE(SDL2-gfx REQUIRED)
+  FIND_PACKAGE(SDL2_image REQUIRED)
+  FIND_PACKAGE(SDL2_ttf REQUIRED)
+  find_package(sdl2-gfx CONFIG REQUIRED)
 else()  # Unix
   FIND_PACKAGE(SDL2_image REQUIRED)
   FIND_PACKAGE(SDL2_ttf REQUIRED)
@@ -162,7 +162,7 @@ add_library(datalib ${DATA_SOURCES} ${DATA_HEADERS})
 if(UNIX)
   set(SDL2_LIBS_ALL ${SDL2_IMAGE_LIBRARIES} ${SDL2_TTF_LIBRARIES} ${SDL2_GFX_LIBRARIES} ${SDL2_LIBRARIES})
 elseif(WIN32)
-  set(SDL2_LIBS_ALL SDL2::SDL2 SDL2::SDL2_image SDL2::SDL2_ttf SDL2::SDL2_gfx SDL2::SDL2main)
+  set(SDL2_LIBS_ALL SDL2::SDL2 SDL2_image::SDL2_image SDL2_ttf::SDL2_ttf SDL2::SDL2_gfx SDL2::SDL2main)
 endif()
 
 set(LIBRARIES gamelib menulib datalib blunted2

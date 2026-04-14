@@ -22,13 +22,28 @@
 #include "../../../../../main.hpp"
 #include "../strategy.hpp"
 
+// ============================================================
+// GoalieDefaultStrategy::RequestInput —— 门将跑位策略
+//
+// 两种主要状态：
+//   A. 球没有直奔球门（正常战术站位）：
+//      - 找从球到球门两柱之间角平分线
+//      - 在该线上找最优站位（减小射门角度）
+//      - 失球且队友来不及拦截时：主动出击（来球减小空间）
+//      - 出击程度还受第二威胁对手影响（避免传给无人盯防的队友）
+//   B. 球飞向球门（CalculateIfBallIsBoundForGoal返回true）：
+//      - 预判球过门线的Y坐标
+//      - 跑到球的飞行轨迹上拦截
+//      - 若球到达时高于2.5米，改为回撤到门线处扑救
+// ============================================================
 void GoalieDefaultStrategy::RequestInput(ElizaController *controller,
                                          const MentalImage *mentalImage,
                                          Vector3 &direction, float &velocity) {
   DO_VALIDATION;
 
-  // base position
-  float lineDistance = 10.0f; // default distance keeper stays in front of goal line
+  // 门将默认站在门线前方10米处
+  float lineDistance = 10.0f;
+  // 球的预测位置（考虑到球员到球需要的时间）
   Vector3 ballPos = mentalImage->GetBallPrediction(600 + static_cast<Player*>(controller->GetPlayer())->GetTimeNeededToGetToBall_ms() * 0.2f).Get2D();
   Vector3 targetPos = Vector3(
       (pitchHalfW - lineDistance) * controller->GetTeam()->GetDynamicSide(), 0,
@@ -38,21 +53,19 @@ void GoalieDefaultStrategy::RequestInput(ElizaController *controller,
 
   float maxVelocity = sprintVelocity;
 
+  // 仅当球在本方半场时才做战术计算（优化性能）
   if (ballPos.coords[0] * controller->GetTeam()->GetDynamicSide() > 0) {
-    DO_VALIDATION;  // optimization
+    DO_VALIDATION;
 
     CalculateIfBallIsBoundForGoal(controller, mentalImage);
 
     if (!IsBallBoundForGoal()) {
-      DO_VALIDATION;
+      // ---- 状态A：战术站位（减小射门角度）----
 
-      // tactical position, make goal as small as possible
+      maxVelocity = sprintVelocity;
 
-
-      maxVelocity = sprintVelocity;//walkVelocity;
-
-      // first, make line from ballPos to one post, then one to the other post, then calculate the line in between.
-      // this line is the line we want our goalie to be on: it splits the goal in to equal halves (in the 'ball view projection', that is)
+      // 从球到左右门柱各画一条线，取角平分线方向
+      // 沿此方向站位 = 门将平分射门角度（视觉上目标最小）
       Vector3 toPost1 =
           Vector3(pitchHalfW * controller->GetTeam()->GetDynamicSide(), 3.7f,
                   0) -
@@ -69,8 +82,7 @@ void GoalieDefaultStrategy::RequestInput(ElizaController *controller,
       ballToGoal.SetVertex(0, ballPos);
       ballToGoal.SetVertex(1, ballPos + middle);
 
-      // this line is now arbitrary length - make it so long that v2 is on the backline
-      // (or rather, near the backline - keeping ON the backline is dangerous; some anims may only touch the ball when it's already behind the line, which is pretty useless :p)
+      // 将射门角平分线延伸到底线（留0.7m安全距离）
       Line backLine;
       backLine.SetVertex(0, Vector3((pitchHalfW - 0.7f) *
                                         controller->GetTeam()->GetDynamicSide(),
@@ -79,23 +91,22 @@ void GoalieDefaultStrategy::RequestInput(ElizaController *controller,
                                         controller->GetTeam()->GetDynamicSide(),
                                     pitchHalfH, 0));
       Vector3 intersect = ballToGoal.GetIntersectionPoint(backLine).Get2D();
-      intersect.coords[1] = clamp(intersect.coords[1], -3.7f, 3.7f);
+      intersect.coords[1] = clamp(intersect.coords[1], -3.7f, 3.7f); // 不超出球门宽度
       ballToGoal.SetVertex(1, intersect);
 
-      float awayFromGoalOffset_m = 0.7f; // meters away from goal line (over the ballToGoal line, not straight forward)
-      float awayFromGoalBias = 0.3f; // factor between goal and ball
+      float awayFromGoalOffset_m = 0.7f; // 距底线的最小距离（沿角平分线方向）
+      float awayFromGoalBias = 0.3f;     // 出击偏置：0=贴门线，1=出击到球
+      // 己方控球时适当离开门线（控球时可以大胆一点）
       awayFromGoalBias *= NormalizedClamp(controller->GetFadingTeamPossessionAmount(), 1.0f, 1.5f);
 
-
-      // when opponent comes rushing in and team mates are too far away to help, come out to 'reduce goal size'
-
+      // ---- 出击逻辑：对方有人突入，且己方无人封堵 ----
       if (controller->GetFadingTeamPossessionAmount() < 1.0f) {
         DO_VALIDATION;
 
         Player *opp = controller->GetOppTeam()->GetDesignatedTeamPossessionPlayer();
         Vector3 oppPos = opp->GetPosition() + opp->GetMovement() * 0.32f;
 
-        // if opp isn't in ball control, don't use ball pos but opp pos
+        // 若对手还没控球，参考对手位置+球位置（混合）
         if (opp->HasPossession() == false) {
           DO_VALIDATION;
           ballToGoal.SetVertex(0, oppPos * 0.6f + ballPos * 0.4f);
@@ -103,14 +114,13 @@ void GoalieDefaultStrategy::RequestInput(ElizaController *controller,
           ballToGoal.SetVertex(0, oppPos * 0.4f + ballPos * 0.6f);
         }
 
-        // first, calculate how close the opponent on the ball is to the goal/shooting treshold
-        float shootThreshold = 20.0f; // average/base value; this distance is dynamic
+        // 计算对手到射门阈值点的距离（动态射门阈值随距离变化）
+        float shootThreshold = 20.0f;
         float oppToGoalDistance = (goalPos - oppPos).GetLength();
-        float oppToThresholdDistance = clamp(oppToGoalDistance - shootThreshold * NormalizedClamp(oppToGoalDistance, 0.0f, shootThreshold * 2.0f), 0.0f, pitchHalfW); // variable threshold distance
+        float oppToThresholdDistance = clamp(oppToGoalDistance - shootThreshold * NormalizedClamp(oppToGoalDistance, 0.0f, shootThreshold * 2.0f), 0.0f, pitchHalfW);
         Vector3 shootingPoint = oppPos + (goalPos - oppPos).GetNormalized(0) * oppToThresholdDistance;
-        //SetGreenDebugPilon(shootingPoint);
 
-        // now calculate the distance between this shooting point and our closest mate
+        // 计算己方最近队友到射门点的距离
         Player *mate = AI_GetClosestPlayer(controller->GetTeam(), shootingPoint, false, static_cast<Player*>(controller->GetPlayer()));
         float mateToThresholdDistance = 99999;
         if (mate) {
@@ -119,89 +129,80 @@ void GoalieDefaultStrategy::RequestInput(ElizaController *controller,
           mateToThresholdDistance = (shootingPoint - matePos).GetLength();
         }
 
+        // 队友比对手离射门点远1米以上 → 门将需要出击
         if (mateToThresholdDistance > oppToThresholdDistance + 1.0f) {
-          DO_VALIDATION;  // come out, brave keeper!
+          DO_VALIDATION;
 
-          awayFromGoalBias = 1.0f;
+          awayFromGoalBias = 1.0f; // 初始设为全出击
 
-          // the amount of 'come out bias' is related to how dangerous the opponent's closest mate is if they are to receive the ball.
-          // basically, the same as the above code, but with the secondary opponent and mate
+          // 但要考虑第二威胁：若对手有接应队友也在危险位置，不能太冒进
           Player *oppHelper = AI_GetClosestPlayer(controller->GetOppTeam(), goalPos, false, opp);
           if (oppHelper) {
             DO_VALIDATION;
 
             Vector3 oppHelperPosition = oppHelper->GetPosition() + oppHelper->GetMovement() * 0.32f;
 
-            // first, calculate how close the opponent helper is to the goal/shooting treshold
-            float helperShootThreshold = 24.0f; // average/base value; this distance is dynamic
+            float helperShootThreshold = 24.0f;
             float oppHelperToGoalDistance = (goalPos - oppHelperPosition).GetLength();
-            float oppHelperToThresholdDistance = clamp(oppHelperToGoalDistance - helperShootThreshold * NormalizedClamp(oppHelperToGoalDistance, 0.0f, helperShootThreshold * 2.0f), 0.0f, pitchHalfW); // variable threshold distance
+            float oppHelperToThresholdDistance = clamp(oppHelperToGoalDistance - helperShootThreshold * NormalizedClamp(oppHelperToGoalDistance, 0.0f, helperShootThreshold * 2.0f), 0.0f, pitchHalfW);
             Vector3 helperShootingPoint = oppHelperPosition + (goalPos - oppHelperPosition).GetNormalized(0) * oppHelperToThresholdDistance;
-            //SetYellowDebugPilon(helperShootingPoint);
 
-            // now calculate the distance between this shooting point and our closest mate
             Player *mateHelper = AI_GetClosestPlayer(controller->GetTeam(), helperShootingPoint, false, static_cast<Player*>(controller->GetPlayer()));
             float mateHelperToThresholdDistance = 99999;
             if (mateHelper) mateHelperToThresholdDistance = (helperShootingPoint - (mateHelper->GetPosition() + mateHelper->GetMovement() * 0.24f)).GetLength();
 
+            // secondaryDistanceDiff：越大说明第二威胁对手越危险 → 减少出击
             float secondaryDistanceDiff = 0.0f;
-            // if this var is bigger, LESS likely to come out because of secondary danger
             if (mateHelperToThresholdDistance > oppHelperToThresholdDistance) secondaryDistanceDiff = NormalizedClamp(mateHelperToThresholdDistance - oppHelperToThresholdDistance, 0.0f, 2.0f);
 
-            // also take into account the ratio between the primary opp to goal and the helper opp to goal distance
-            // if this var is bigger, LESS likely to come out because of secondary danger
+            // helperVSPrimaryDistanceRatio：接应对手越接近主威胁距离，越危险
             float helperVSPrimaryDistanceRatio = 1.0f - NormalizedClamp(oppHelperToThresholdDistance / (oppToThresholdDistance + 0.0001f), 1.0f, 1.5f);
-            helperVSPrimaryDistanceRatio *= 0.7f; // always allow some coming out despite opp mate danger
+            helperVSPrimaryDistanceRatio *= 0.7f; // 允许一定程度出击，不完全退缩
 
+            // 综合出击偏置
             awayFromGoalBias = clamp(1.0f - (secondaryDistanceDiff * helperVSPrimaryDistanceRatio), 0.0f, 1.0f);
           }
         }
 
       }  // end keeper come out code
 
+      // 队伍AI强制冲出（ApplyKeeperRush触发）
       bool applyRushOut = controller->GetTeam()->GetController()->GetEndApplyKeeperRush_ms() > controller->GetMatch()->GetActualTime_ms();
       if (applyRushOut) awayFromGoalBias = 1.0f;
 
-      float distance = std::max(ballToGoal.GetLength() - 0.5f, 0.0f); // keep distance from target, we don't want to overshoot
-      awayFromGoalOffset_m = clamp(distance * awayFromGoalBias, awayFromGoalOffset_m, pitchHalfW); // when ball is farther away, goalie stays farther away from goal (to make runs when necessary)
+      // 实际离门线距离 = ballToGoal线长 × 出击偏置（但不低于最小距离）
+      float distance = std::max(ballToGoal.GetLength() - 0.5f, 0.0f);
+      awayFromGoalOffset_m = clamp(distance * awayFromGoalBias, awayFromGoalOffset_m, pitchHalfW);
 
-      // offset from goal line
+      // 目标位置 = 底线交点沿角平分线向球方向偏移awayFromGoalOffset_m
       targetPos = ballToGoal.GetVertex(1) + (ballToGoal.GetVertex(0) - ballToGoal.GetVertex(1)).GetNormalized(0) * awayFromGoalOffset_m;
-      //SetGreenDebugPilon(targetPos);
 
-/* disabled: just rush to ball even if we probably can't make it there. this stuff doesn't work good enough (yet?)
-      // time we assume it will take for the ball to arrive at some point (in other words: how fast the attacker gets the ball there)
-      float time1_sec = (targetPos - ballToGoal.GetVertex(0)).GetLength() / sprintVelocity;
-      float time2_sec = (ballToGoal.GetVertex(1) - ballToGoal.GetVertex(0)).GetLength() / sprintVelocity;
-
-      //SetYellowDebugPilon(targetPos);
-      targetPos = CalculateBestAchievableTarget(CastPlayer(), targetPos, time1_sec, ballToGoal.GetVertex(1), time2_sec);
-      SetRedDebugPilon(targetPos + Vector3(0, 0, 0.1f));
-*/
-
-      // when going back to goal: go slower to allow for proper body direction
+      // 回撤时（目标比当前更靠近门线）减速，给动画足够时间转身
       float u = 0.0f;
       float distanceToBallToGoalLine = ballToGoal.GetDistanceToPoint(controller->GetPlayer()->GetPosition(), u);
       if ((targetPos - goalPos).GetLength() < (controller->GetPlayer()->GetPosition() - goalPos).GetLength() &&
           distanceToBallToGoalLine < 1.0f && u > 0.0f) maxVelocity = walkVelocity;
 
-      targetPos.coords[0] = clamp(targetPos.coords[0], -pitchHalfW + 0.2f, pitchHalfW - 0.2f); // not very useful to stand behind backline
+      targetPos.coords[0] = clamp(targetPos.coords[0], -pitchHalfW + 0.2f, pitchHalfW - 0.2f);
 
     } else {
-      // intercept ball
+      // ---- 状态B：球飞向球门，跑到轨迹上拦截 ----
       maxVelocity = sprintVelocity;
 
       Line ballToGoal;
       ballToGoal.SetVertex(0, mentalImage->GetBallPrediction(10).Get2D());
       float minGoalLineDist = 0.4f;
+      // 球预计落点（在门线上）
       Vector3 ballOverGoalLinePos =
           Vector3(pitchHalfW * controller->GetTeam()->GetDynamicSide(),
                   ballBoundForGoal_ycoord, 0);
       ballOverGoalLinePos += (ballToGoal.GetVertex(0) - ballOverGoalLinePos).GetNormalized(0) * minGoalLineDist;
       ballToGoal.SetVertex(1, ballOverGoalLinePos);
       float u = 0.0f;
+      // 门将当前位置（0.05秒后）到球轨迹线的最近点参数u
       float distance = ballToGoal.GetDistanceToPoint(controller->GetPlayer()->GetPosition() + controller->GetPlayer()->GetMovement() * 0.05f, u);
 
+      // 预测1秒后球的位置，判断门将能否在球落地前到达拦截点
       float u_at_1sec = 0.0f;
       float distance_at_1sec = ballToGoal.GetDistanceToPoint(mentalImage->GetBallPrediction(1010).Get2D(), u_at_1sec);
 
@@ -210,6 +211,7 @@ void GoalieDefaultStrategy::RequestInput(ElizaController *controller,
         DO_VALIDATION;
         float time_to_reach_gk = u / u_at_1sec;
         Vector3 ball_position_at_gk = mentalImage->GetBallPrediction(10 + 1000 * time_to_reach_gk);
+        // 若到达门将时球高于2.5米，改回撤（高球扑救方式不同）
         if (ball_position_at_gk.coords[2] > 2.5) {
           DO_VALIDATION;
           should_gk_run_towards_the_goal = true;
@@ -220,11 +222,12 @@ void GoalieDefaultStrategy::RequestInput(ElizaController *controller,
 
       if (should_gk_run_towards_the_goal) {
         DO_VALIDATION;
-        targetPos = ballOverGoalLinePos;
+        targetPos = ballOverGoalLinePos; // 回撤到门线落点
       } else {
+        // 跑到球轨迹的最近拦截点
         targetPos = ballToGoal.GetVertex(0) + (ballToGoal.GetVertex(1) - ballToGoal.GetVertex(0)) * u;
         targetPos.coords[2] = 0.0;
-        targetPos.coords[0] = clamp(targetPos.coords[0], -pitchHalfW + 0.2f, pitchHalfW - 0.2f); // not very useful to stand behind line
+        targetPos.coords[0] = clamp(targetPos.coords[0], -pitchHalfW + 0.2f, pitchHalfW - 0.2f);
       }
     }
   }

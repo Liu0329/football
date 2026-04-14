@@ -98,37 +98,50 @@ Player *SelectAttackingRunPlayer(Team *team) {
   return attackingRunPlayer;
 }
 
+// ============================================================
+// TeamAIController::Process —— 团队AI每帧决策
+// 主要职责：
+//   1. 每秒更新战术参数（进攻性偏置 offensivenessBias）
+//   2. 计算越位陷阱线（offsideTrapX）
+//   3. 评估对方球员危险度，排序（用于盯人分配）
+//   4. 每500ms触发一次前插跑判断
+//   5. 每1500ms更新前场支援球员
+// ============================================================
 void TeamAIController::Process() {
   DO_VALIDATION;
 
+  // 每1000ms重新计算战术参数（根据比分、控球率）
   if (match->GetActualTime_ms() % 1000 == 0) UpdateTactics();
 
   CalculateSituation();
 
-  float startDistance = 30.0f + 20.0f * offensivenessBias; // distance from goal where we start holding the opponents (but are likely to fallback somewhat)
-  float forceDistance = 6.0f; // minimum distance from goal - try to 'hold' the opp there
+  // ---- 计算越位陷阱线 ----
+  // startDistance：开始对对手施压的距离（进攻性越强，越远离本方球门）
+  float startDistance = 30.0f + 20.0f * offensivenessBias;
+  float forceDistance = 6.0f; // 不能比本方球门近于此距离（最后防线）
 
+  // deepestDanger：越位陷阱线的X坐标（取以下几个值的最大值）
   float deepestDanger = (pitchHalfW - startDistance) * team->GetDynamicSide();
 
-  // ball as max
+  // 1. 球当前位置作为越位线参考
   float adaptedBallX = match->GetBall()->Predict(0).coords[0];
-  // when far away from our goal (startDistance), drop back more easily. closer to forceDistance, don't buckle.
   adaptedBallX *=
-      team->GetDynamicSide();  // > 0 == on our half (easier to work with)
-  float offsetX = 20.0f + 10.0f * (1.0f - offensivenessBias); // when ball is this distance away from startDistance, we start falling back more towards forceDistance.
-  float startToForcedBias = NormalizedClamp(adaptedBallX, pitchHalfW - startDistance - offsetX, pitchHalfW - forceDistance); // where, between startDistance and forceDistance, is the ball? 0 .. 1
-  adaptedBallX += offsetX * (1.0f - startToForcedBias); // the fall back intensity gradually diminishes when getting closer to forceDistance
-  adaptedBallX *= team->GetDynamicSide();  // back to absolute space
+      team->GetDynamicSide(); // 转换到"正值=本方半场"的坐标系
+  // offsetX：球离startDistance越近，回退越少；离forceDistance越近，越坚守
+  float offsetX = 20.0f + 10.0f * (1.0f - offensivenessBias);
+  float startToForcedBias = NormalizedClamp(adaptedBallX, pitchHalfW - startDistance - offsetX, pitchHalfW - forceDistance);
+  adaptedBallX += offsetX * (1.0f - startToForcedBias);
+  adaptedBallX *= team->GetDynamicSide(); // 还原坐标
   if (adaptedBallX * team->GetDynamicSide() >
       deepestDanger * team->GetDynamicSide())
     deepestDanger = adaptedBallX;
 
-  // ballfuture as max
+  // 2. 球700ms后的预测位置（防止球快速推进时防线来不及压）
   if (match->GetBall()->Predict(700).coords[0] * team->GetDynamicSide() >
       deepestDanger * team->GetDynamicSide())
     deepestDanger = match->GetBall()->Predict(700).coords[0];
 
-  // opp as max
+  // 3. 对方控球者位置（加4m警戒距离，给防线预留封堵空间）
   Player *opp = match->GetTeam(abs(team->GetID() - 1))->GetDesignatedTeamPossessionPlayer();
   float cautionDistance = 4.0f * team->GetDynamicSide();
   if ((opp->GetPosition().coords[0] + opp->GetMovement().coords[0] * 0.15f +
@@ -138,26 +151,25 @@ void TeamAIController::Process() {
     deepestDanger = opp->GetPosition().coords[0] +
                     opp->GetMovement().coords[0] * 0.1f + cautionDistance;
 
-  // slacking teammate as max
+  // 4. 己方最后一道防线的位置（允许落后4m，避免己方被越位的球员干扰防线）
   float lineX = AI_GetOffsideLine(match, match->GetMentalImage(0),
                                   abs(team->GetID()));
-  float allowSlackDistance = 4.0f; // despite teammates slacking behind line this much, just hold the line
+  float allowSlackDistance = 4.0f;
   if (lineX * team->GetDynamicSide() - allowSlackDistance >
       deepestDanger * team->GetDynamicSide()) {
     DO_VALIDATION;
     deepestDanger = lineX - allowSlackDistance * team->GetDynamicSide();
   }
 
+  // 最终越位陷阱线
   offsideTrapX = deepestDanger;
-  // disable
-  //offsideTrapX = pitchHalfW * team->GetSide();
 
 
-  // calculate who's dangerous
-
+  // ---- 评估对方球员危险度，生成排序后的tacticalOpponentInfo ----
   std::vector<Player*> players;
   match->GetActiveTeamPlayers(abs(team->GetID() - 1), players);
 
+  // 最危险位置 = 本方球门前2米（偏向球的位置20%）
   Vector3 mostDangerousPos =
       Vector3((pitchHalfW - 2.0) * team->GetDynamicSide(), 0, 0);
   mostDangerousPos = mostDangerousPos * 0.8f + match->GetBall()->Predict(100).Get2D() * 0.2f;
@@ -169,69 +181,47 @@ void TeamAIController::Process() {
     TacticalOpponentInfo info;
     info.player = players[i];
 
+    // 危险因子：越靠近最危险位置越高（归一化距离的倒数）
     info.dangerFactor = 1.0 - NormalizedClamp((players[i]->GetPosition() - mostDangerousPos).GetLength(), 0, pitchHalfW * 2);
 
-    // player on ball is most dangerous
+    // 持球球员额外+0.05（确保始终被最优先盯防）
     info.dangerFactor *= 0.95f;
     if (players[i] == match->GetTeam(abs(team->GetID() - 1))->GetDesignatedTeamPossessionPlayer()) info.dangerFactor += 0.05f;
 
     tacticalOpponentInfo.push_back(info);
   }
 
-  // sort list
+  // 按危险度降序排序（CalculateManMarking按此顺序分配盯人）
   std::sort(tacticalOpponentInfo.begin(), tacticalOpponentInfo.end(), ReverseSortTacticalOpponentInfo);
 
 
-  // team pressure
-
+  // 整体施压（已禁用，会和其他防守AI冲突）
   /* DISABLED, interferes with other defense AI code for now
-    if (team->GetHumanGamerCount() == 0) { DO_VALIDATION;
-      if (match->GetBestPossessionTeamID() != team->GetID()) { DO_VALIDATION;
-
-        bool opponentFreeRun = false;
-        Player *opp = match->GetTeam(abs(team->GetID() -
-    1))->GetDesignatedTeamPossessionPlayer(); Vector3 dangerPos =
-    Vector3(pitchHalfW * team->GetSide(), opp->GetPosition().coords[1] * 0.5,
-    0); float oppDangerDistance = (opp->GetPosition() - dangerPos).GetLength();
-        Vector3 adaptedGoalPos = Vector3(pitchHalfW * team->GetSide(), 0, 0) *
-    0.5 + opp->GetPosition() * 0.5; float oppGoalDistance = (opp->GetPosition()
-    - adaptedGoalPos).GetLength(); Player *p = AI_GetClosestPlayer(team,
-    adaptedGoalPos, false); float usGoalDistance = (p->GetPosition() -
-    adaptedGoalPos).GetLength(); if (usGoalDistance > oppGoalDistance - 3.2)
-    opponentFreeRun = true;
-
-        bool closeEnemy = false;
-        if (oppDangerDistance < 20) closeEnemy = true;
-
-        if (opponentFreeRun || closeEnemy) { DO_VALIDATION;
-          ApplyTeamPressure();
-        }
-      }
-    }
+    ...
   */
 
-  // trigger attacking runs
-
+  // ---- 每500ms触发一次前插跑判断 ----
   if (match->GetActualTime_ms() % 500 == 0 &&
       endApplyAttackingRun_ms <= match->GetActualTime_ms()) {
     DO_VALIDATION;
     if (team->GetHumanGamerCount() < 2) {
-      DO_VALIDATION;  // with >= 2 human players, one can do the running
-                      // manually
+      // 人类玩家≥2时由玩家自己控制前插，不需要AI触发
+      DO_VALIDATION;
       if (match->GetBestPossessionTeam() == team) {
         DO_VALIDATION;
 
         float neededRating = 0.5f;
 
-        // from a certain distance, running is not very useful (can't pass that far)
+        // 选取前插跑球员（控球者前方约26米处最近的队友）
         Player *runner = SelectAttackingRunPlayer(team);
         if (runner) {
           DO_VALIDATION;
           float distance = (runner->GetPosition() - team->GetDesignatedTeamPossessionPlayer()->GetPosition()).GetLength();
+          // 距离评分：40米内越近越好（太远传不到）
           float distanceRating =
               std::pow(1.0f - NormalizedClamp(distance, 0, 40), 0.5f);
 
-          // more likely to run when there's less defenders in front
+          // 对手密度评分：前方对手越少，前插越有价值
           std::vector<Player*> opponents;
           Vector3 spot = runner->GetPosition() * Vector3(1.0f, 0.8f, 0.0f) +
                          Vector3(team->GetDynamicSide() * 10.0f, 0, 0);
@@ -240,13 +230,15 @@ void TeamAIController::Process() {
           for (unsigned int i = 0; i < opponents.size(); i++) {
             DO_VALIDATION;
             float oppDistance = (opponents[i]->GetPosition() - spot).GetLength();
+            // 15米内的对手每个减少0.3分（减法累加）
             float oppDistanceRatingInv = std::pow(
                 curve(1.0f - NormalizedClamp(oppDistance, 0, 15), 1.0f), 0.5f);
-            oppDensityRating -= oppDistanceRatingInv * 0.3f; // subtractive!
+            oppDensityRating -= oppDistanceRatingInv * 0.3f;
           }
 
           float runConditionsRating = distanceRating * oppDensityRating;
 
+          // 综合评分超过0.5才触发前插跑
           if (runConditionsRating >= neededRating) {
             DO_VALIDATION;
             ApplyAttackingRun();
@@ -256,6 +248,8 @@ void TeamAIController::Process() {
     }
   }
 
+  // 每1500ms更新"前场支援球员"（离控球者最近的非控球者）
+  // 该球员在力场计算中会获得更激进的前插权重
   if (match->GetActualTime_ms() % 1500 == 0) {
     DO_VALIDATION;
     forwardSupportPlayer = AI_GetClosestPlayer(
@@ -318,6 +312,19 @@ float mixup(float base, const std::string &varname, e_PlayerRole role) {
   }
 }
 
+// ============================================================
+// GetAdaptedFormationPosition —— 根据战术参数计算阵型目标位置
+//
+// 核心思路：以球场中心为基准，根据控球情况（possessionBias）
+// 动态调整各球员的目标位置，实现整体阵型的攻守转换。
+// 影响因素：
+//   - possessionBias：控球程度（决定进攻还是防守参数）
+//   - depth/width：阵型的纵深和宽度
+//   - sideFocus：横向聚焦（跟随球的位置）
+//   - midfieldFocus：纵向聚焦（中场高低位置）
+//   - microFocus：超短时聚焦（紧跟控球者）
+//   - offsideTrapX：越位线限制（后卫不能站太前）
+// ============================================================
 Vector3 TeamAIController::GetAdaptedFormationPosition(
     Player *player, bool useDynamicFormationPosition) {
   DO_VALIDATION;
@@ -330,8 +337,11 @@ Vector3 TeamAIController::GetAdaptedFormationPosition(
   if (useDynamicFormationPosition) role = player->GetDynamicFormationEntry().role;
                               else role = player->GetFormationEntry().role;
 
+  // 核心参考点：控球者位置
   Vector3 focalPoint = match->GetDesignatedPossessionPlayer()->GetPosition();
+  // 紧迫程度：离控球者越近，越紧迫（需要快速响应），时间平滑窗口越短
   float urgencyBias = 1.0f - NormalizedClamp((focalPoint - player->GetPosition()).GetLength(), 2.0f, 30.0f);
+  // 球的平均位置（时间窗口越长越平滑，避免阵型随球抖动）
   float ballX = match->GetBall()->GetAveragePosition(3500 * (1.0f - urgencyBias * 0.7f)).coords[0];
   float ballY = match->GetBall()->GetAveragePosition(4000 * (1.0f - urgencyBias * 0.5f)).coords[1];
 
@@ -355,50 +365,56 @@ Vector3 TeamAIController::GetAdaptedFormationPosition(
   offense_sideFocusStrength = clamp(offense_sideFocusStrength + -0.3f + (       offensivenessBias) * 0.3f, 0.0f, 1.0f);
   defense_sideFocusStrength = clamp(defense_sideFocusStrength + -0.3f + (1.0f - offensivenessBias) * 0.3f, 0.0f, 1.0f);
 
+  // possessionAmountBias：从控球量映射到进攻/防守偏置 [0.3, 0.7]
   float possessionAmountBias = NormalizedClamp(fadingTeamPossessionAmount - 0.5f, 0.3f, 0.7f);
-  // also take the ball's position as part of the possessionBias equation
+  // ballBias：球在哪半场（0=本方半场，1=对方半场），控球不明朗时参考球位
   float ballBias =
       NormalizedClamp(((ballX / pitchHalfW) * -team->GetDynamicSide()), -0.7f,
-                      0.7f);  // 0 == own half, 1 == opponent half
-  // if possessionBias is unclear (near 0.5), take ballBias more seriously as
-  // indicator of possession.
-  float ballBiasBias = 1.0f - fabs(possessionAmountBias * 2.0f - 1.0f); // biasception
-  ballBiasBias *= 0.6f; // don't take ballBias too serious - we need defenders to somewhat keep watch when possession team is unclear, even when the ball is forward
+                      0.7f);
+  // ballBiasBias：控球越不明朗（接近0.5），越多参考球位（最大60%权重）
+  float ballBiasBias = 1.0f - fabs(possessionAmountBias * 2.0f - 1.0f);
+  ballBiasBias *= 0.6f;
+  // 综合控球偏置（混合控球量和球位）
   float possessionBias = possessionAmountBias * (1.0f - ballBiasBias) +
                          ballBias * ballBiasBias;
 
+  // 加入进攻性偏置（由UpdateTactics根据比分调整）
   possessionBias = clamp(possessionBias + (offensivenessBias - 0.5f) * 0.3f, 0.0f, 1.0f);
 
-  // offense can be a bit more relaxed
+  // 进攻时参考球的3秒平均位置（更稳定），防守时参考更短时均值+控球者位置
   focalPoint = (match->GetBall()->GetAveragePosition(3000).Get2D() * 1.0f + focalPoint * 0.0f) * possessionBias +
                (match->GetBall()->GetAveragePosition(2000).Get2D() * 0.5f + focalPoint * 0.5f) * (1.0f - possessionBias);
 
+  // 根据控球情况混合进攻/防守深度和宽度参数
   float adaptedDepth = depth * (offense_depthFactor * possessionBias +
                                 defense_depthFactor * (1.0f - possessionBias));
   float adaptedWidth = width * (offense_widthFactor * possessionBias +
                                 defense_widthFactor * (1.0f - possessionBias));
 
+  // 纵向偏移：进攻时向前，防守时靠后（ownHalfFactor控制）
   float offsetX =
       pitchHalfW * team->GetDynamicSide() *
       ((offense_ownHalfFactor * 2.0f - 1.0f) * possessionBias +
        (defense_ownHalfFactor * 2.0f - 1.0f) * (1.0f - possessionBias));
 
+  // 横向聚焦强度（进攻时跟球更紧，防守时分散更多）
   float sideFocusStrength = (offense_sideFocusStrength * possessionBias +
                              defense_sideFocusStrength * (1.0f - possessionBias));
 
-  float sideFocus = possessionBias * 2.0f - 1.0f; // -1 == own side, 1 == opp side
+  float sideFocus = possessionBias * 2.0f - 1.0f; // -1=本方半场聚焦，1=对方半场聚焦
 
+  // sideX：横向中心参考（20%控球方向 + 80%近6秒控球侧平均）
   float sideX = 0.2f * sideFocus * -team->GetDynamicSide() * pitchHalfW +
                 0.8f * -match->GetAveragePossessionSide(6000) * pitchHalfW;
-  // exaggerate: sideX = clamp(sideX * 2.0f, -pitchHalfW, pitchHalfW);
+  // 阵型横向中心X坐标（球位置 × (1-侧重强度) + 侧重位置 × 侧重强度 + 纵向偏移）
   float centerX = clamp((ballX * (1.0f - sideFocusStrength) + sideX * sideFocusStrength) + offsetX, -pitchHalfW, pitchHalfW);
 
-  // center of width
+  // 阵型横向中心Y坐标（跟随球的Y坐标）
   float centerY = clamp(ballY, -pitchHalfH, pitchHalfH);
 
-  // leave space for actual depth (50% depth on both sides of center)
-  float adaptCenterToFitDepthBias = 0.95f; // the lower this value, the more players will move with the centerX, and be clamped to the edges of the pitch
-  float adaptCenterToFitWidthBias = 0.9f; // the lower this value, the more players will move with the centerY, and be clamped to the edges of the pitch
+  // 让中心留出实际深度/宽度的空间（避免球员被压到边线外）
+  float adaptCenterToFitDepthBias = 0.95f;
+  float adaptCenterToFitWidthBias = 0.9f;
   centerX *= ( (1.0f - adaptedDepth) / 1.0f ) * adaptCenterToFitDepthBias + (1.0f - adaptCenterToFitDepthBias);
   centerY *= ( (1.0f - adaptedWidth) / 1.0f ) * adaptCenterToFitWidthBias + (1.0f - adaptCenterToFitWidthBias);
 
@@ -475,12 +491,24 @@ Vector3 TeamAIController::GetAdaptedFormationPosition(
   return desiredPos;
 }
 
+// ============================================================
+// CalculateDynamicRoles —— 用匈牙利算法动态分配球员角色
+//
+// 问题：11名球员 × 11个阵型位置，如何最优分配让总移动距离最小？
+// 算法：匈牙利算法（最小权值二分匹配），时间复杂度O(n³)
+//
+// 特别处理：
+//   - 门将不参与动态角色分配（始终守门）
+//   - 使用分层距离阈值：从最短距离开始尝试，直到找到有效分配
+//     （这样优先让球员换到近的位置，减少不必要的大范围移动）
+// ============================================================
 void TeamAIController::CalculateDynamicRoles() {
   DO_VALIDATION;
 
   std::vector<Player*> players;
   team->GetActivePlayers(players);
 
+  // 移除门将（不参与角色互换）
   std::vector<Player*>::iterator iter = players.begin();
   while (iter != players.end()) {
     DO_VALIDATION;
@@ -493,14 +521,14 @@ void TeamAIController::CalculateDynamicRoles() {
 
   unsigned int playerNum = players.size();
 
-  // collect adapted formation positions
+  // 预计算所有球员到所有阵型位置的距离
   std::vector<Vector3> adaptedFormationPositions;
   for (unsigned int y = 0; y < playerNum; y++) {
     DO_VALIDATION;
     adaptedFormationPositions.push_back(GetAdaptedFormationPosition(players.at(y), false));
   }
 
-  // first make a sorted list on all possible distances between players and formation targets
+  // 所有 playerNum² 个距离的排序列表（用于分层阈值）
   std::vector<int> distances;
   for (unsigned int x = 0; x < playerNum; x++) {
     DO_VALIDATION;
@@ -515,11 +543,11 @@ void TeamAIController::CalculateDynamicRoles() {
 
   std::sort(distances.begin(), distances.end());
 
+  // 从第playerNum小距离开始，每次尝试稍大的阈值，直到找到有效的完整分配
   for (unsigned int i = playerNum; i < distances.size(); i += 5) {
     DO_VALIDATION;
 
-    // libhungarian by Cyrill Stachniss, 2004
-
+    // 使用 Cyrill Stachniss 2004年的匈牙利算法库
     hungarian_problem_t p;
 
 #ifdef WIN32
@@ -528,6 +556,7 @@ void TeamAIController::CalculateDynamicRoles() {
     int r[playerNum * playerNum];
 #endif
 
+    // 构建代价矩阵：超过当前阈值的距离设为50000（禁止分配）
     for (unsigned int x = 0; x < playerNum; x++) {
       DO_VALIDATION;
       for (unsigned int y = 0; y < playerNum; y++) {
@@ -536,7 +565,7 @@ void TeamAIController::CalculateDynamicRoles() {
         const Vector3 &formationPos = adaptedFormationPositions.at(y);
         float cost = (playerPos - formationPos).GetLength();
         int intCost = int(std::round(cost * 10));
-        if (intCost >= distances[i]) intCost = 50000;
+        if (intCost >= distances[i]) intCost = 50000; // 超阈值 → 禁止该分配
         r[x + y * playerNum] = intCost;
       }
     }
@@ -547,27 +576,14 @@ void TeamAIController::CalculateDynamicRoles() {
     int** m = array_to_matrix(r, playerNum, playerNum);
 #endif
 
-    /* initialize the hungarian_problem using the cost matrix*/
     int matrix_size = hungarian_init(&p, m, playerNum, playerNum, HUNGARIAN_MODE_MINIMIZE_COST);
-
-    //fprintf(stderr, "assignment matrix has %d rows and %d columns.\n\n", matrix_size, matrix_size);
-
-    /* some output */
-    //fprintf(stderr, "cost-matrix:");
-    //hungarian_print_costmatrix(&p);
-
-    /* solve the assignment problem */
     int totalCost = hungarian_solve(&p);
 
-    /* some output */
-    //fprintf(stderr, "assignment:");
-    //hungarian_print_assignment(&p);
-
     bool ready = false;
+    // totalCost!=-1 且 < 50000 表示找到了合法的完整分配（不含禁止项）
     if (totalCost != -1 && (totalCost < 50000 || i >= distances.size() - 5)) {
       DO_VALIDATION;
-      //printf("total cost: %i\n", totalCost);
-      // assign dynamic role with best cost
+      // 根据匈牙利算法的分配结果，更新每个球员的动态阵型条目
       for (unsigned int x = 0; x < playerNum; x++) {
         DO_VALIDATION;
         for (unsigned int y = 0; y < playerNum; y++) {
@@ -575,7 +591,7 @@ void TeamAIController::CalculateDynamicRoles() {
           if ((&p)->assignment[y][x] == 1) {
             DO_VALIDATION;
             FormationEntry formationEntry = players.at(y)->GetFormationEntry();
-            players.at(x)->SetDynamicFormationEntry(formationEntry);
+            players.at(x)->SetDynamicFormationEntry(formationEntry); // 球员x获得位置y的角色
           }
         }
       }
@@ -583,7 +599,6 @@ void TeamAIController::CalculateDynamicRoles() {
       ready = true;
     }
 
-    /* free used memory */
     hungarian_free(&p);
     for (unsigned int blah = 0; blah < playerNum; blah++) {
       DO_VALIDATION;
@@ -1218,6 +1233,15 @@ void TeamAIController::CalculateSituation() {
   oppTimeNeededToGetToBall = match->GetTeam(1 - team->GetID())->GetTimeNeededToGetToBall_ms();
 }
 
+// ============================================================
+// UpdateTactics —— 每秒更新战术参数
+//
+// 根据比分差和剩余时间计算进攻性偏置（offensivenessBias）：
+//   - 落后越多 + 时间越少 → 越进攻（bias趋向1）
+//   - 领先越多 + 时间越少 → 越防守（bias趋向0）
+//   - 近60秒控球率也影响：长期占球的队更激进
+// 最终将用户自定义战术调整（userProperties）叠加到基础战术上。
+// ============================================================
 void TeamAIController::UpdateTactics() {
   DO_VALIDATION;
   const TeamTactics &teamTactics = team->GetTeamData()->GetTactics();
@@ -1229,15 +1253,15 @@ void TeamAIController::UpdateTactics() {
 
   liveTeamTactics = baseTeamTactics;
 
-  // when trailing, we need goals. when leading, defend lead
+  // 比分因子：落后1球→goalFactor=0.75（更进攻），领先1球→0.25（更防守）
   float goalFactor = clamp(0.5 + (oppGoals - goals) * 0.25f, 0.0f, 1.0f);
-  // time still to play matters - get more desperate towards the end
+  // 时间因子：比赛越接近结束越极端（0.5→1.0，越到后面越决绝）
   float timeFactor = 0.5f + 0.5f * clamp(match->GetMatchTime_ms() / 6300000.0f, 0.0f, 1.0f);
-  //printf("timefactor: %f\n", timeFactor);
 
+  // 进攻偏置：(goalFactor - 0.5) × timeFactor 表示"需要进攻/防守的程度"
   float offenseBias = clamp(0.5f + (goalFactor - 0.5f) * (timeFactor * 1.0f), 0.0f, 1.0f);
 
-
+  // 最近60秒控球率影响进攻性（控球多的队倾向进攻）
   float possessionFactor = match->GetMatchData()->GetPossessionFactor_60seconds();
   float recentPossessionBias;
   DO_VALIDATION;
@@ -1247,12 +1271,10 @@ void TeamAIController::UpdateTactics() {
     recentPossessionBias = 0.5 + possessionFactor * 0.5f;
   }
 
+  // 综合进攻性偏置（比分+时间 × 50% + 近期控球率 × 50%）
   offensivenessBias = offenseBias * 0.5f + recentPossessionBias * 0.5f;
-  //if (team->GetID() == 0) printf("T1 offensivenessBias: %f\n", offensivenessBias);
-  //if (team->GetID() == 1) printf("T2 offensivenessBias: %f\n", offensivenessBias);
 
-  //autoBias = clamp(fabs(offenseBias - 0.5f) * 2.0f, 0.0f, 1.0f); // don't use too much autobias when things are calm (= offenseBias being around 0.5)
-
+  // 叠加用户自定义战术调整（从teamdata传入的userProperties）
   const map_Properties *userMods = userTacticsModifiers.GetProperties();
   map_Properties::const_iterator iter = userMods->begin();
   while (iter != userMods->end()) {
@@ -1262,17 +1284,13 @@ void TeamAIController::UpdateTactics() {
     float userOffset = atof(iter->second.c_str());
     float offset = userOffset;
 
-    // feed back to teamdata (todo: hasn't this system been effectively disabled? if so, delete it to avoid confusion)
-    //teamTacticsWritable.liveProperties.Set(iter->first.c_str(), offset);
-
+    // 将用户偏移 [0,1] → [-multiplier, +multiplier]
     offset = (offset - 0.5f) * 2.0f * multiplier;
 
     float baseValue = baseTeamTactics.GetReal(iter->first.c_str(), -1.0f);
-    // printf("value: %s\n", iter->first.c_str());
     if (baseValue >= 0.0f) {
-      DO_VALIDATION;  // not all user mods from teamdata are used in this class
-                      // (for example, individual settings like dribble stuff),
-                      // ignore them
+      // 只处理在本类中有意义的战术参数（单球员设置如dribble不在此处）
+      DO_VALIDATION;
       liveTeamTactics.Set(iter->first.c_str(), clamp(baseValue + offset, 0.0f, 1.0f));
     }
     iter++;

@@ -156,12 +156,17 @@ Vector3 AI_GetAdaptedFormationPosition(
   return position;
 }
 
+// ============================================================
+// AI_CalculateFreeSpace —— 计算某位置的自由空间（无对手威胁程度）
+//
+// 模拟未来futureTime_sec秒后，对手全力跑向focusPos，
+// 计算他们能到多近（在safeDistance范围内的威胁总量）。
+// 返回值：0=完全被包围，1=完全自由
+// ============================================================
 float AI_CalculateFreeSpace(Match *match, const MentalImage *mentalImage,
                             int teamID, const Vector3 &focusPos,
                             float safeDistance, float futureTime_sec) {
   DO_VALIDATION;
-  //void AI_GetClosestPlayers(Team *team, const Vector3 &position, bool onlyAIControlled, std::vector<Player*> &result, unsigned int playerCount)
-
 
   assert(mentalImage);
 
@@ -169,27 +174,37 @@ float AI_CalculateFreeSpace(Match *match, const MentalImage *mentalImage,
 
   auto opponentPlayerImages = mentalImage->GetTeamPlayerImages(abs(teamID - 1));
 
-  // player position predictions
   for (int i = 0; i < (signed int)opponentPlayerImages.size(); i++) {
     DO_VALIDATION;
     if (opponentPlayerImages[i].player_role != e_PlayerRole_GK) {
       DO_VALIDATION;
 
-      // resulting opp position
-      opponentPlayerImages[i].position = opponentPlayerImages[i].position + opponentPlayerImages[i].movement * 0.2f; // slowness
+      // 对手0.2秒减速后的位置（模拟反应时间）
+      opponentPlayerImages[i].position = opponentPlayerImages[i].position + opponentPlayerImages[i].movement * 0.2f;
+      // 对手以全速冲向focusPos，最多移动futureTime_sec秒
       Vector3 toFocusMovement = (focusPos - opponentPlayerImages[i].position).GetNormalized(0) * sprintVelocity * clamp(futureTime_sec - 0.2f, 0.0f, 1000.0f);
       if (toFocusMovement.GetLength() > (focusPos - opponentPlayerImages[i].position).GetLength()) toFocusMovement = focusPos - opponentPlayerImages[i].position;
       opponentPlayerImages[i].position += toFocusMovement;
 
+      // 对手越靠近focusPos，贡献的威胁越大（线性从0到1）
       float situation = 1.0f - clamp((opponentPlayerImages[i].position - focusPos).GetLength(), 0, safeDistance) / safeDistance;
 
       currentSituation += situation;
     }
   }
 
+  // 归一化：2.5个对手在旁边≈完全包围
   return 1.0f - NormalizedClamp(currentSituation, 0.0f, 2.5f);
 }
 
+// ============================================================
+// AI_GetOffsideLine —— 计算指定队伍的越位线X坐标
+//
+// 足球规则：越位线由"倒数第二深的"对方球员决定（第一深的通常是门将）
+// 参数teamID：被越位的防守方队伍ID
+// futureSim_ms：预测未来多少ms的球员位置（考虑运动趋势）
+// 返回值：越位线X坐标（球不能在此线之前接球）
+// ============================================================
 float AI_GetOffsideLine(Match *match, const MentalImage *mentalImage,
                         int teamID, unsigned int futureSim_ms) {
   DO_VALIDATION;
@@ -197,15 +212,15 @@ float AI_GetOffsideLine(Match *match, const MentalImage *mentalImage,
 
   auto opponentPlayerImages = mentalImage->GetTeamPlayerImages(teamID);
 
+  // Step 1: 找最深的对方球员（dudDeepestOpponent）
   int dudDeepestOpponent = 0;
   Vector3 deepestOpponentPosition;
 
   for (int i = 0; i < (signed int)opponentPlayerImages.size(); i++) {
     DO_VALIDATION;
-
+    // 基于未来位置预测（速度×时间）
     opponentPlayerImages[i].position.coords[0] += opponentPlayerImages[i].movement.coords[0] * futureSim_ms * 0.001f;
 
-    // for offside
     if (opponentPlayerImages[i].position.coords[0] * side >
         opponentPlayerImages.at(dudDeepestOpponent).position.coords[0] * side) {
       DO_VALIDATION;
@@ -213,7 +228,8 @@ float AI_GetOffsideLine(Match *match, const MentalImage *mentalImage,
     }
   }
 
-  // offside: we are actually looking for the one-but-deepest opponent (association football rule! EAT THAT, PES6!! :P)
+  // Step 2: 找"倒数第二深"的球员（正式越位线）
+  // 国际足球规则：越位线由除最后一名球员之外的次深球员决定
   for (int i = 0; i < (signed int)opponentPlayerImages.size(); i++) {
     DO_VALIDATION;
     if (opponentPlayerImages[i].position.coords[0] * side >
@@ -225,16 +241,27 @@ float AI_GetOffsideLine(Match *match, const MentalImage *mentalImage,
   }
 
   float offsideLine = deepestOpponentPosition.coords[0];
+  // 球的位置也可以作为越位线（球在最后防线前时，以球为准）
   if (mentalImage->GetBallPrediction(0).coords[0] * side > offsideLine * side) {
     DO_VALIDATION;
     offsideLine = mentalImage->GetBallPrediction(0).coords[0];
   }
+  // 越位线不能在己方半场以外（确保在本半场范围内）
   if (offsideLine * side < 0) offsideLine = 0;
   offsideLine = clamp(offsideLine, -pitchHalfW, pitchHalfW);
 
   return offsideLine;
 }
 
+// ============================================================
+// AI_GetBestDribbleMovement —— 控球带球的最优移动方向
+//
+// 用力场法决定带球方向：
+//   - 排斥：最近的5名对手（避免撞人）
+//   - 排斥：边线和底线（不出界）
+//   - 吸引：对方球门（向前推进）
+// 最终输出desiredDirection和desiredVelocity供ElizaController使用。
+// ============================================================
 void AI_GetBestDribbleMovement(Match *match, PlayerBase *p,
                                const MentalImage *mentalImage,
                                Vector3 &desiredDirection,
@@ -246,18 +273,19 @@ void AI_GetBestDribbleMovement(Match *match, PlayerBase *p,
   Vector3 myPos = player->GetPosition();
   Vector3 myMov = player->GetMovement();
 
+  // 进攻因子：进攻型球员（mindSet高）更直接冲向球门
   float offenseFactor = 0.7f + teamTactics.userProperties.GetReal("dribble_offensiveness", 0.5f) * 0.05f + AI_GetMindSet(player->GetDynamicFormationEntry().role) * 0.05f;
-  float powerMultiplier = 1.0f; // should alter (average) resulting velocity
+  float powerMultiplier = 1.0f;
 
-  float future_sec = 0.25f;
+  float future_sec = 0.25f; // 预测0.25秒后的位置
 
   PlayerImage thisPlayerImage = mentalImage->GetPlayerImage(player);
 
   Team *team = player->GetTeam();
   signed int side = team->GetDynamicSide();
 
+  // 取最近的5名对手（用于排斥计算）
   std::vector<PlayerImage> opponentPlayerImages;
-
   std::vector<Player*> opponents;
   AI_GetClosestPlayers(match->GetTeam(abs(team->GetID() - 1)), myPos, false, opponents, 5);
   for (unsigned int i = 0; i < opponents.size(); i++) {
@@ -265,17 +293,18 @@ void AI_GetBestDribbleMovement(Match *match, PlayerBase *p,
     opponentPlayerImages.push_back(mentalImage->GetPlayerImage(opponents[i]));
   }
 
+  // 靠近底线时减少向边路的分量（让球员内切）
   float nearBackline = NormalizedClamp(fabs(player->GetPosition().coords[0]) / pitchHalfW, 0.0f, 1.0f);
   float centerModifierInv =
       1.0f -
-      std::pow(nearBackline,
-               2.0f);  // near the end of the pitch, we want to get inside again
-  centerModifierInv *= 0.5f; // stop going to the sides! wtf, todo, why does it prefer the sideline so much (probably because of no opponents :P)
+      std::pow(nearBackline, 2.0f);
+  centerModifierInv *= 0.5f;
+  // 球门吸引目标：y坐标随中路磁力参数调整（越中路磁力越强，Y越小）
   Vector3 oppGoalPos = Vector3(-side * pitchHalfW, myPos.coords[1] * (1.0f - teamTactics.userProperties.GetReal("dribble_centermagnet", 0.5f)) * centerModifierInv, 0);
-
 
   std::vector<ForceSpot> forceField;
 
+  // 力场1：对手排斥（0.25秒后预测位置）
   for (unsigned int i = 0; i < opponentPlayerImages.size(); i++) {
     DO_VALIDATION;
 
@@ -286,15 +315,16 @@ void AI_GetBestDribbleMovement(Match *match, PlayerBase *p,
     spot.origin = oppPos;
     spot.magnetType = e_MagnetType_Repel;
     spot.decayType = e_DecayType_Variable;
-    spot.power = 2.0f * powerMultiplier;//1.0f;
-    spot.scale = 10.0f;//16.0f;
-    spot.exp = 1.0f;//0.7f;
+    spot.power = 2.0f * powerMultiplier;
+    spot.scale = 10.0f;
+    spot.exp = 1.0f;
     forceField.push_back(spot);
   }
 
-  // sideline / backline
+  // 力场2：边线/底线排斥（防止出界）
   {
     ForceSpot spot;
+    // 侧线排斥（y方向）
     spot.origin = Vector3(myPos.coords[0], (pitchHalfH + 5.0f) * signSide(myPos.coords[1]), 0);
     spot.magnetType = e_MagnetType_Repel;
     spot.decayType = e_DecayType_Variable;
@@ -303,6 +333,7 @@ void AI_GetBestDribbleMovement(Match *match, PlayerBase *p,
     spot.exp = 0.7f;
     forceField.push_back(spot);
 
+    // 底线排斥（x方向）
     spot.origin = Vector3((pitchHalfW + 5.0f) * signSide(myPos.coords[0]), myPos.coords[1], 0);
     spot.magnetType = e_MagnetType_Repel;
     spot.decayType = e_DecayType_Variable;
@@ -312,7 +343,7 @@ void AI_GetBestDribbleMovement(Match *match, PlayerBase *p,
     forceField.push_back(spot);
   }
 
-  // love for da goal
+  // 力场3：球门吸引（向前带球的核心动力）
   {
     ForceSpot spot;
     spot.origin = oppGoalPos;
@@ -322,20 +353,30 @@ void AI_GetBestDribbleMovement(Match *match, PlayerBase *p,
     forceField.push_back(spot);
   }
 
-  //Vector3 forceFieldPosition = AI_GetForceFieldPosition(forceField, myPos);
+  // 基于0.25秒后的预测位置计算力场合力
   Vector3 forceFieldMovement = AI_GetForceFieldMovement(forceField, myPos + myMov * future_sec, 1.0f);
 
   desiredDirection = forceFieldMovement.GetNormalized(player->GetDirectionVec());
   desiredVelocity = clamp(forceFieldMovement.GetLength() * distanceToVelocityMultiplier, idleVelocity, sprintVelocity);
-  desiredVelocity = RangeVelocity(desiredVelocity);
+  desiredVelocity = RangeVelocity(desiredVelocity); // 量化到档位速度
 }
 
+// ============================================================
+// AI_GetForceFieldMovement —— 计算力场合力产生的移动向量
+//
+// 遍历所有力场源（ForceSpot），根据距离和衰减类型计算各源的
+// 对当前位置的影响向量，最终叠加为合力移动向量。
+//
+// ForceSpot属性：
+//   magnetType: Attract（吸引）或 Repel（排斥）
+//   decayType:  Constant（不衰减）或 Variable（按距离衰减）
+//   power, scale, exp: 力的大小、范围、指数
+// attractorDampingDistance: 进入此距离后减弱吸引力（防过冲）
+// ============================================================
 Vector3 AI_GetForceFieldMovement(const std::vector<ForceSpot> &forceField,
                                  const Vector3 &currentPos,
                                  float attractorDampingDistance) {
   DO_VALIDATION;
-
-  // attractorDampingDistance: from this distance to attractor, dampen influence so we won't overshoot target
 
   Vector3 cumulVec;
   float cumulForce = 0.0f;
@@ -1006,13 +1047,22 @@ void AI_GetAutoPass(e_FunctionType passType, const Vector3 &vector,
   float distanceExp = 1.4f;
   if (passType == e_FunctionType_HighPass) {
     DO_VALIDATION;
-    heightOffset = 0.45f - NormalizedClamp(vector.GetLength(), 0.0f, 60.0f) * 0.15f;// 0.37f;
-    powerFactor = 1.15f;//1.75
-    distanceExp = 1.4f;//1.6
+    // 扩展距离上限到 100m（原来 60m 导致超过 60m 的高传球速封顶，无法真正踢远）
+    // heightOffset 随距离从 0.45（近）降到 0.30（远），距离越远弧线越平
+    heightOffset = 0.45f - NormalizedClamp(vector.GetLength(), 0.0f, 100.0f) * 0.15f;
+    powerFactor = 1.15f;
+    distanceExp = 1.4f;
+  } else if (passType == e_FunctionType_ShortPass) {
+    DO_VALIDATION;
+    // 短传：完全贴地，球离地高度不超过 0.1m
+    // heightOffset 接近 0 → 出球方向几乎水平，球在草地上滚动
+    heightOffset = 0.01f;
   }
   resultingDirection = (vector.GetNormalized(0) + Vector3(0, 0, heightOffset)).GetNormalized(0);
+  // 高传用 100m 上限（原 60m 导致超过 60m 的高传球速封顶），其他传球保持 60m
+  float distanceMax = (passType == e_FunctionType_HighPass) ? 100.0f : 60.0f;
   resultingPower =
-      std::pow(NormalizedClamp(vector.GetLength(), 0.0f, 60.0f), distanceExp) *
+      std::pow(NormalizedClamp(vector.GetLength(), 0.0f, distanceMax), distanceExp) *
       powerFactor;
 }
 

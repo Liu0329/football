@@ -24,10 +24,8 @@ bool AIControlledKeyboard::GetButton(e_ButtonFunction buttonFunction) {
 
 void AIControlledKeyboard::ResetNotSticky() {
   DO_VALIDATION;
-  buttons_pressed_[e_ButtonFunction_LongPass] = false;
-  buttons_pressed_[e_ButtonFunction_HighPass] = false;
-  buttons_pressed_[e_ButtonFunction_ShortPass] = false;
-  buttons_pressed_[e_ButtonFunction_Shot] = false;
+  // pass/shot 不再被清除：与 sprint 一致，按下后保持为 true 直到 Python 发送 release。
+  // 这样 Python 不需要每帧重发 pass/shot，避免 sticky hack 吞掉其他按键的 release 事件。
   buttons_pressed_[e_ButtonFunction_Sliding] = false;
   buttons_pressed_[e_ButtonFunction_Switch] = false;
 }

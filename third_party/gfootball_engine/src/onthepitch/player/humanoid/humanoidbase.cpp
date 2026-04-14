@@ -606,6 +606,8 @@ void HumanoidBase::UpdateFullbodyModel(bool updateSrc) {
   GetTracker()->setDisabled(false);
 }
 
+// Advance currentAnim.frameNum, handle end-of-clip / interrupts and SelectAnim,
+// then fill animApplyBuffer for the upcoming Animation::Apply in FetchPutBuffers.
 void HumanoidBase::Process() {
   DO_VALIDATION;
 
@@ -757,6 +759,7 @@ void HumanoidBase::PreparePutBuffers() {
   CalculateGeomOffsets();
 }
 
+// Drive the visible skeleton: apply current clip frame to nodeMap joints.
 void HumanoidBase::FetchPutBuffers() {
   DO_VALIDATION;
   animApplyBuffer.anim->Apply(nodeMap, animApplyBuffer.frameNum, -1, animApplyBuffer.smooth, animApplyBuffer.smoothFactor, animApplyBuffer.position, animApplyBuffer.orientation, animApplyBuffer.offsets, &movementHistory, 10, animApplyBuffer.noPos, false);

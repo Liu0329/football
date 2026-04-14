@@ -68,6 +68,7 @@ void HumanController::RequestCommand(PlayerCommandQueue &commandQueue) {
     actionBufferTime_ms = 0;
     shotPressStartTime_ms = -1;
     shotQueuedGauge_ms = -1;
+    passQueuedGauge_ms = -1;
   }
 
   if (actionMode == 1 &&
@@ -90,6 +91,7 @@ void HumanController::RequestCommand(PlayerCommandQueue &commandQueue) {
     actionBufferTime_ms = 0;
     shotPressStartTime_ms = -1;
     shotQueuedGauge_ms = -1;
+    passQueuedGauge_ms = -1;
   }
 
   // high pass cancel
@@ -131,25 +133,28 @@ void HumanController::RequestCommand(PlayerCommandQueue &commandQueue) {
 
     // 用时间戳计算实际按压时长，避免依赖 gauge_ms（每帧被 ResetNotSticky 清除）
     int currentEffectiveGauge_ms = gauge_ms;
-    if (actionButton == e_ButtonFunction_Shot && shotPressStartTime_ms >= 0) {
+    if (shotPressStartTime_ms >= 0) {
       int elapsed = match->GetActualTime_ms() - shotPressStartTime_ms;
       currentEffectiveGauge_ms = clamp(elapsed, 10, 1000);
     }
+    // 射门：500ms 自动触发（留时间给动画，不必等到松键）
+    // 传球（短传/长传/高传）：只在松键或满蓄1000ms时触发，玩家完全控制时机
+    int autoTriggerThreshold_ms = (actionButton == e_ButtonFunction_Shot) ? 500 : 1000;
     if (!hid->GetButton(actionButton) ||
-        (hid->GetButton(actionButton) &&
-         currentEffectiveGauge_ms >
-             500) ||  // allow anim to kick in before queue is complete (before
-                      // button is released), it will usually touch ball after
-                      // the remaining time anyway, so we still have time to add
-                      // more power, yet still respond as fast as possible
+        (hid->GetButton(actionButton) && currentEffectiveGauge_ms >= autoTriggerThreshold_ms) ||
         (!CastPlayer()->HasPossession() && !match->IsInSetPiece() &&
          actionBufferTime_ms > 0)) {
       DO_VALIDATION;
 
-      // baseTime_ms：人类物理上无法按得更短的最小时长（60ms），从有效蓄力时间中减去
-      // gaugeFactor：归一化到 [0, 1] 的蓄力比例，满蓄约需按住 1000ms
-      int baseTime_ms = 60; // substract a little because we can't really press a button shorter than this
-      float gaugeFactor = (gauge_ms - baseTime_ms) * (1.0f / float(1000 - baseTime_ms));
+      // 用时间戳计算真实按压时长（跨环境步，不受 ResetNotSticky 影响）
+      // 传球满蓄上限 1000ms；短按（~100ms）→ 约 4%；长按（~1000ms）→ 100%
+      int baseTime_ms = 60;
+      int effectivePress_ms = gauge_ms;
+      if (shotPressStartTime_ms >= 0) {
+        int elapsed = match->GetActualTime_ms() - shotPressStartTime_ms;
+        effectivePress_ms = clamp(elapsed, 10, 1000);
+      }
+      float gaugeFactor = (effectivePress_ms - baseTime_ms) * (1.0f / float(1000 - baseTime_ms));
       gaugeFactor = clamp(gaugeFactor, 0.0f, 1.0f);
 
       // action button released!
@@ -175,59 +180,82 @@ void HumanController::RequestCommand(PlayerCommandQueue &commandQueue) {
 
         commandQueue.push_back(command);
 
-      } else if (actionButton == e_ButtonFunction_ShortPass) {
-        DO_VALIDATION;
-
-        PlayerCommand command;
-        command.desiredFunctionType = e_FunctionType_ShortPass;
-        command.useDesiredMovement = false;
-        command.useDesiredLookAt = false;
-
-        // 短传力量：pow指数0.7，曲线较陡，短按即可达到较高力量
-        float inputPower = clamp(std::pow(gaugeFactor, 0.7f), 0.01f, 1.0f);
-        command.touchInfo.inputDirection = inputDirection;
-        command.touchInfo.inputPower = inputPower;
-        command.touchInfo.autoDirectionBias = GetConfiguration()->GetReal("gameplay_shortpass_autodirection", _default_ShortPass_AutoDirection);
-        command.touchInfo.autoPowerBias = GetConfiguration()->GetReal("gameplay_shortpass_autopower", _default_ShortPass_AutoPower);
-        AI_GetPass(CastPlayer(), command.desiredFunctionType, command.touchInfo.inputDirection, command.touchInfo.inputPower, command.touchInfo.autoDirectionBias, command.touchInfo.autoPowerBias, command.touchInfo.desiredDirection, command.touchInfo.desiredPower, command.touchInfo.targetPlayer);
-
-        commandQueue.push_back(command);
-
-      } else if (actionButton == e_ButtonFunction_LongPass) {
-        DO_VALIDATION;
-
-        PlayerCommand command;
-        command.desiredFunctionType = e_FunctionType_LongPass;
-        command.useDesiredMovement = false;
-        command.useDesiredLookAt = false;
-
-        // 长传/直塞力量：pow指数0.65，曲线比短传更陡，更容易蓄满
-        float inputPower = clamp(std::pow(gaugeFactor, 0.65f), 0.01f, 1.0f);
-        command.touchInfo.inputDirection = inputDirection;
-        command.touchInfo.inputPower = inputPower;
-        command.touchInfo.autoDirectionBias = GetConfiguration()->GetReal("gameplay_throughpass_autodirection", _default_ThroughPass_AutoDirection);
-        command.touchInfo.autoPowerBias = GetConfiguration()->GetReal("gameplay_throughpass_autopower", _default_ThroughPass_AutoPower);
-        AI_GetPass(CastPlayer(), command.desiredFunctionType, command.touchInfo.inputDirection, command.touchInfo.inputPower, command.touchInfo.autoDirectionBias, command.touchInfo.autoPowerBias, command.touchInfo.desiredDirection, command.touchInfo.desiredPower, command.touchInfo.targetPlayer);
-
-        commandQueue.push_back(command);
-
       } else if (actionButton == e_ButtonFunction_HighPass) {
         DO_VALIDATION;
+
+        // ===== 高传：与射门完全一致的逻辑 =====
+        // gaugeFactor [0,1] 线性映射到目标距离 [6m, 100m]
+        // 完全绕过 AI_GetPass 的队友查找和方向修正，直接调用 AI_GetAutoPass：
+        //   - 方向：完全等于玩家输入方向，右就是右，不找任何队友
+        //   - 弧度：由 AI_GetAutoPass 根据距离自动计算高球弧线 heightOffset
+        //   - 球速：由 AI_GetAutoPass 根据距离计算，与玩家 gaugeFactor 完全正比
+        const float highPassMinDist = 6.0f;
+        const float highPassMaxDist = 100.0f;
+        float targetDist = highPassMinDist + gaugeFactor * (highPassMaxDist - highPassMinDist);
+        // targetVec = 玩家输入方向 × 目标距离，完全无 AI 修正
+        Vector3 targetVec = inputDirection * targetDist;
 
         PlayerCommand command;
         command.desiredFunctionType = e_FunctionType_HighPass;
         command.useDesiredMovement = false;
         command.useDesiredLookAt = false;
-
-        // 高球力量：pow指数0.55，曲线最陡，轻按即可打出较远的高球
-        float inputPower = clamp(std::pow(gaugeFactor, 0.55f), 0.01f, 1.0f);
         command.touchInfo.inputDirection = inputDirection;
-        command.touchInfo.inputPower = inputPower;
-        command.touchInfo.autoDirectionBias = GetConfiguration()->GetReal("gameplay_highpass_autodirection", _default_HighPass_AutoDirection);
-        command.touchInfo.autoPowerBias = GetConfiguration()->GetReal("gameplay_highpass_autopower", _default_HighPass_AutoPower);
-        AI_GetPass(CastPlayer(), command.desiredFunctionType, command.touchInfo.inputDirection, command.touchInfo.inputPower, command.touchInfo.autoDirectionBias, command.touchInfo.autoPowerBias, command.touchInfo.desiredDirection, command.touchInfo.desiredPower, command.touchInfo.targetPlayer);
+        command.touchInfo.inputPower = clamp(targetDist / 60.0f, 0.01f, 2.0f);
+        command.touchInfo.targetPlayer = nullptr;
+        // 直接从目标向量计算弧线方向和球速，不经过任何 AI 队友选择
+        AI_GetAutoPass(e_FunctionType_HighPass, targetVec,
+                       command.touchInfo.desiredDirection, command.touchInfo.desiredPower);
 
+        printf("[HighPass] gaugeFactor=%.3f targetDist=%.1fm desiredPower=%.3f\n",
+               gaugeFactor, targetDist, command.touchInfo.desiredPower);
+
+        passQueuedGauge_ms = effectivePress_ms;
         commandQueue.push_back(command);
+
+      } else if (actionButton == e_ButtonFunction_ShortPass ||
+                 actionButton == e_ButtonFunction_LongPass) {
+        DO_VALIDATION;
+
+        // ===== 短传/长传：与高传完全相同的纯手动逻辑 =====
+        // 完全绕过 AI_GetPass，直接调用 AI_GetAutoPass：
+        //   - 方向：100% 等于玩家输入方向，不找任何队友
+        //   - 距离：gaugeFactor 线性映射到 [minDist, maxDist]
+        //   - 球速：由 AI_GetAutoPass 根据距离计算
+        // 短传 (S)：4m ~ 30m，贴地滚动（heightOffset≈0）
+        // 长传 (W)：6m ~ 60m，稍微弹起（heightOffset=0.11）
+        {
+          float minDist, maxDist;
+          e_FunctionType funcType;
+          if (actionButton == e_ButtonFunction_ShortPass) {
+            minDist  = 4.0f;
+            maxDist  = 30.0f;
+            funcType = e_FunctionType_ShortPass;
+          } else {
+            minDist  = 6.0f;
+            maxDist  = 60.0f;
+            funcType = e_FunctionType_LongPass;
+          }
+
+          float targetDist = minDist + gaugeFactor * (maxDist - minDist);
+          Vector3 targetVec = inputDirection * targetDist;
+
+          PlayerCommand command;
+          command.desiredFunctionType = funcType;
+          command.useDesiredMovement = false;
+          command.useDesiredLookAt = false;
+          command.touchInfo.inputDirection = inputDirection;
+          command.touchInfo.inputPower = clamp(targetDist / 60.0f, 0.01f, 2.0f);
+          command.touchInfo.targetPlayer = nullptr;
+          AI_GetAutoPass(funcType, targetVec,
+                         command.touchInfo.desiredDirection, command.touchInfo.desiredPower);
+
+          printf("[%s] gaugeFactor=%.3f targetDist=%.1fm desiredPower=%.3f\n",
+                 (actionButton == e_ButtonFunction_ShortPass) ? "ShortPass" : "LongPass",
+                 gaugeFactor, targetDist, command.touchInfo.desiredPower);
+
+          passQueuedGauge_ms = effectivePress_ms;
+          commandQueue.push_back(command);
+        }
 
       } else if (actionButton == e_ButtonFunction_Shot) {
         DO_VALIDATION;
@@ -337,25 +365,9 @@ void HumanController::RequestCommand(PlayerCommandQueue &commandQueue) {
     if (hid->GetButton(e_ButtonFunction_Dribble)) idleTurnToOpponentGoal = true;
     if (hid->GetButton(e_ButtonFunction_Dribble) && hid->GetButton(e_ButtonFunction_Sprint)) knockOn = true;
 
-    // special adapted input for ballcontrol and trap, when we have shoot/pass buffers
+    // 蓄力时不限制移动：玩家可以自由移动和改变方向
     Vector3 inputDirectionSave2 = inputDirection;
     float inputVelocitySave2 = inputVelocityFloat;
-    if (actionMode == 2) {
-      DO_VALIDATION;
-      float dot = CastPlayer()->GetDirectionVec().GetDotProduct(inputDirection) * 0.5f + 0.5f;
-      if (dot < 0) {
-        DO_VALIDATION;
-        dot = 0;
-      }
-      if (CastPlayer()->GetEnumVelocity() != e_Velocity_Idle) {
-        DO_VALIDATION;
-        inputDirection = (CastPlayer()->GetDirectionVec() * 1.0f + inputDirection * 0.0f).GetNormalized(inputDirection); // want inputdirection to be biggest, so we won't stubbornly fail to do 180s
-      }
-      dot = std::pow(dot, 1.5f);  // prefer braking, even on slight angles
-      dot = dot * 0.8f + 0.2f;
-      dot *= 0.9f; // else, <=walk-anims may never work (backheels and such)
-      inputVelocityFloat = CastPlayer()->GetFloatVelocity() * dot;
-    }
 
     // ball control?
     bool keepCurrentBodyDirection = false;
@@ -386,11 +398,7 @@ void HumanController::RequestCommand(PlayerCommandQueue &commandQueue) {
     forceMagnet = true;
     extraHaste = true;
   }
-  if (actionMode == 2) {
-    DO_VALIDATION;
-    forceMagnet = true;
-    extraHaste = true;
-  }
+  // 蓄力传球/射门时不启用 forceMagnet，让玩家自由移动不被吸向球
   _MovementCommand(commandQueue, forceMagnet, extraHaste);
 
   if (commandQueue.size() > 0) {
@@ -552,6 +560,7 @@ void HumanController::Process() {
         DO_VALIDATION;
         actionMode = 2;
         actionButton = e_ButtonFunction_ShortPass;
+        shotPressStartTime_ms = match->GetActualTime_ms();
       }
 
       if (hid->GetButton(e_ButtonFunction_LongPass) &&
@@ -560,6 +569,7 @@ void HumanController::Process() {
         DO_VALIDATION;
         actionMode = 2;
         actionButton = e_ButtonFunction_LongPass;
+        shotPressStartTime_ms = match->GetActualTime_ms();
       }
 
       if (hid->GetButton(e_ButtonFunction_HighPass) &&
@@ -568,6 +578,7 @@ void HumanController::Process() {
         DO_VALIDATION;
         actionMode = 2;
         actionButton = e_ButtonFunction_HighPass;
+        shotPressStartTime_ms = match->GetActualTime_ms();
       }
 
       if (hid->GetButton(e_ButtonFunction_Shot) &&
@@ -632,6 +643,7 @@ void HumanController::Reset() {
   actionBufferTime_ms = 0;
   shotPressStartTime_ms = -1;
   shotQueuedGauge_ms = -1;
+  passQueuedGauge_ms = -1;
 
   lastSwitchTime_ms = -10000;
   lastSwitchTimeDuration_ms = 300;

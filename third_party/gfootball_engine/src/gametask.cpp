@@ -52,6 +52,8 @@ bool GameTask::StopMatch() {
   return false;
 }
 
+// Simulation tick: logic and animation state (Humanoid::Process), then apply
+// clips to skeletons (FetchPutBuffers -> Animation::Apply).
 void GameTask::ProcessPhase() {
   DO_VALIDATION;
   bool process = match->Process();
@@ -62,6 +64,7 @@ void GameTask::ProcessPhase() {
   }
 }
 
+// Before draw: sync fullbody geometry from bones and upload mesh data.
 void GameTask::PrepareRender() {
   match->Put();
   std::vector<Player*> players;

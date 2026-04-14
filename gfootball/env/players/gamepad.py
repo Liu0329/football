@@ -25,10 +25,10 @@ from gfootball.env import event_queue
 BUTTON_TO_ACTIONS = {
     0: [football_action_set.action_short_pass,
         football_action_set.action_pressure],
-    1: [football_action_set.action_shot,
-        football_action_set.action_team_pressure],
-    2: [football_action_set.action_high_pass,
+    1: [football_action_set.action_high_pass,
         football_action_set.action_sliding],
+    2: [football_action_set.action_shot,
+        football_action_set.action_team_pressure],
     3: [football_action_set.action_long_pass,
         football_action_set.action_keeper_rush],
     4: [football_action_set.action_switch],

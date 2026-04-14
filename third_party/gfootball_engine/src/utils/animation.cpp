@@ -1035,6 +1035,8 @@ void Animation::DirtyCache() {
     }
   }
 
+  // Parse a single .anim file: CSV keyframe block (LoadData), optional
+  // "extension" rows, then trailing XML in customData for game-specific tags.
   void Animation::Load(const std::string &filename) {
     DO_VALIDATION;
     name = filename;

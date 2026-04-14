@@ -36,44 +36,63 @@ ElizaController::ElizaController(Match *match, bool lazyPlayer)
 
 ElizaController::~ElizaController() { DO_VALIDATION; }
 
+// ============================================================
+// RequestCommand —— 内置AI每帧决策入口
+// 负责判断当前情境并向 commandQueue 推送本帧的行动指令。
+// 指令优先级（从高到低）：
+//   1. 进球庆祝
+//   2. 停球时朝向裁判
+//   3. 比赛暂停 / 懒人球员 → 站立不动
+//   4. 定位球执行球员 / 持球球员
+//   5. 无球球员跑位策略（后卫/中场/前锋）
+//   6. 指定控球球员 → 传/射/带球
+//   7. 门将专属逻辑
+//   8. 全员：球控/停球/干扰/滑铲
+//   9. 移动指令（包含逼抢、盯人）
+// ============================================================
 void ElizaController::RequestCommand(PlayerCommandQueue &commandQueue) {
   DO_VALIDATION;
+  // 获取当前帧的"心理快照"（AI看到的延迟世界状态）
   auto _mentalImage = match->GetMentalImage(_mentalImageTime);
   lastSwitchTimeDuration_ms = 0;
   lastSwitchTime_ms = 0;
 
   CastPlayer()->SetDesiredTimeToBall_ms(0);
 
+  // 计算当前情境（控球、体力等）
   _CalculateSituation();
 
-  _Preprocess(); // calculate some variables
+  // 预处理：计算若干中间变量
+  _Preprocess();
 
 
   FormationEntry entry = CastPlayer()->GetDynamicFormationEntry();
+  // mindSet: 0=纯防守型 ~ 1=纯进攻型，决定跑位激进程度
   float mindSet = AI_GetMindSet(entry.role);
 
 
-  // input
-
+  // --- 原始输入方向/速度（由策略层写入，供移动指令使用）---
   Vector3 rawInputDirection = player->GetDirectionVec();
   float rawInputVelocityFloat = idleVelocity;
   Vector3 manualMovementDirection = player->GetDirectionVec();
   float manualMovementVelocityFloat = idleVelocity;
 
-  bool manualMovement = false;
-  bool extraHaste = false;
+  bool manualMovement = false; // true时跳过自动移动逻辑（门将拦截）
+  bool extraHaste = false;     // true时移动更紧迫（抢球争夺中）
 
 
-  // celebrate good times come on!
-
+  // -------------------------------------------------------
+  // 1. 进球庆祝
+  // -------------------------------------------------------
   if (!match->IsInPlay() && match->IsGoalScored()) {
     DO_VALIDATION;
     _AddCelebration(commandQueue);
     return;
   }
 
-  // look at referee
-
+  // -------------------------------------------------------
+  // 2. 停球期间朝向裁判（犯规类型2/3，比赛暂停后1秒内）
+  // -------------------------------------------------------
   else if (!match->IsInPlay() &&
            match->GetReferee()->GetBuffer().active == true &&
            (match->GetReferee()->GetCurrentFoulType() == 2 ||
@@ -84,7 +103,7 @@ void ElizaController::RequestCommand(PlayerCommandQueue &commandQueue) {
                match->GetActualTime_ms()) {
     DO_VALIDATION;
 
-    // look at referee
+    // 站立，面朝裁判位置
     PlayerCommand command;
     command.desiredFunctionType = e_FunctionType_Movement;
     command.useDesiredMovement = true;
@@ -98,7 +117,9 @@ void ElizaController::RequestCommand(PlayerCommandQueue &commandQueue) {
     return;
   }
 
-  // stand still
+  // -------------------------------------------------------
+  // 3. 比赛暂停 或 懒人球员：减速至停止，视线对准球
+  // -------------------------------------------------------
   else if (!match->IsInPlay() || lazyPlayer) {
     DO_VALIDATION;  // this whole if/then/else structure is ugly and unclear
 
@@ -106,23 +127,25 @@ void ElizaController::RequestCommand(PlayerCommandQueue &commandQueue) {
     command.desiredFunctionType = e_FunctionType_Movement;
     command.useDesiredMovement = true;
     if (match->GetBallRetainer() == player) {
+      // 持球时朝向场地中心，准备发球
       DO_VALIDATION;
       command.desiredDirection = (Vector3(0) - player->GetPosition()).GetNormalized(player->GetDirectionVec());
     } else {
       command.desiredDirection = player->GetDirectionVec();
     }
     command.desiredVelocityFloat = idleVelocity;
-    // if (!match->IsInSetPiece()) { DO_VALIDATION;
+    // 方向混合：60%保持当前方向 + 40%朝向中心 → 自然减速
     command.desiredDirection =
         (player->GetDirectionVec() * 0.6f +
          (Vector3(0) - player->GetPosition())
                  .GetNormalized(player->GetDirectionVec()) *
              0.4f)
             .GetNormalized(player->GetDirectionVec());
+    // 速度逐帧衰减（×0.95），加随机抖动，模拟不同球员减速节奏
     command.desiredVelocityFloat = ClampVelocity(
         player->GetFloatVelocity() * 0.95f - boostrandom(0.0f, 3.2f));
-    //}
     command.useDesiredLookAt = true;
+    // 视线朝向球的位置（让球员面球）
     command.desiredLookAt =
         player->GetPosition() +
         (match->GetBall()->Predict(0).Get2D() - player->GetPosition())
@@ -133,8 +156,9 @@ void ElizaController::RequestCommand(PlayerCommandQueue &commandQueue) {
     return;
   }
 
-  // set piece taking
-
+  // -------------------------------------------------------
+  // 4. 定位球执行球员 / 持球球员（门将发球等）
+  // -------------------------------------------------------
   else if ((match->IsInSetPiece() &&
             team->GetController()->GetPieceTaker() == player) ||
            match->GetBallRetainer() == player) {
@@ -142,12 +166,14 @@ void ElizaController::RequestCommand(PlayerCommandQueue &commandQueue) {
 
     PlayerCommand actionCommand;
 
+    // --- 4a. 点球：直接射门 ---
     if (team->GetController()->GetSetPieceType() == e_GameMode_Penalty) {
       DO_VALIDATION;
 
       actionCommand.desiredFunctionType = e_FunctionType_Shot;
       actionCommand.useDesiredMovement = false;
       actionCommand.useDesiredLookAt = false;
+      // 射门方向：对方球门中心偏随机[-5,5]米（y轴），模拟点球落点
       actionCommand.touchInfo.desiredDirection =
           (Vector3(-team->GetDynamicSide() * pitchHalfW, boostrandom(-5, 5),
                    0) -
@@ -157,19 +183,21 @@ void ElizaController::RequestCommand(PlayerCommandQueue &commandQueue) {
       commandQueue.push_back(actionCommand);
 
     } else {
+      // --- 4b. 其他定位球：传球 ---
       actionCommand.desiredFunctionType = e_FunctionType_ShortPass;
       actionCommand.useDesiredMovement = false;
       actionCommand.useDesiredLookAt = false;
       actionCommand.touchInfo.inputDirection = player->GetDirectionVec();
       actionCommand.touchInfo.inputPower = 0.5f;
-      actionCommand.touchInfo.autoDirectionBias = 1.0f;
-      actionCommand.touchInfo.autoPowerBias = 1.0f;
+      actionCommand.touchInfo.autoDirectionBias = 1.0f; // 完全依赖AI自动选方向
+      actionCommand.touchInfo.autoPowerBias = 1.0f;     // 完全依赖AI自动选力度
 
       actionCommand.touchInfo.forcedTargetPlayer = 0;
 
       Vector3 desiredTargetPosition;
       bool doCommand = true;
 
+      // 球门球：60%概率高球长传，40%概率短传
       if (team->GetController()->GetSetPieceType() == e_GameMode_GoalKick) {
         DO_VALIDATION;
         if (boostrandom(0.0f, 1.0f) > 0.4f && team->GetHumanGamerCount() == 0) {
@@ -185,12 +213,14 @@ void ElizaController::RequestCommand(PlayerCommandQueue &commandQueue) {
                       boostrandom(-pitchHalfH, pitchHalfH), 0.0f);
         }
 
+      // 开球：直接短传给身前队友
       } else if (team->GetController()->GetSetPieceType() ==
                  e_GameMode_KickOff) {
         DO_VALIDATION;
         actionCommand.desiredFunctionType = e_FunctionType_ShortPass;
         desiredTargetPosition = player->GetPosition() + player->GetDirectionVec() * 1.0f;
 
+      // 任意球：50%高球传远，50%短传到斜前方
       } else if (team->GetController()->GetSetPieceType() ==
                  e_GameMode_FreeKick) {
         DO_VALIDATION;
@@ -206,6 +236,7 @@ void ElizaController::RequestCommand(PlayerCommandQueue &commandQueue) {
                                               boostrandom(-10.0f, 10.0f), 0.0f);
         }
 
+      // 角球：70%传禁区，30%短角球
       } else if (team->GetController()->GetSetPieceType() ==
                  e_GameMode_Corner) {
         DO_VALIDATION;
@@ -223,12 +254,14 @@ void ElizaController::RequestCommand(PlayerCommandQueue &commandQueue) {
                       player->GetPosition().coords[1] * 0.8f, 0.0f);
         }
 
+      // 界外球：短传给最近队友
       } else if (team->GetController()->GetSetPieceType() ==
                  e_GameMode_ThrowIn) {
         DO_VALIDATION;
         actionCommand.desiredFunctionType = e_FunctionType_ShortPass;
         desiredTargetPosition = player->GetPosition(); // closest to player
 
+      // 门将持球（如接球后）：高球传到前场，但先检查目标队友是否被对手紧逼
       } else if (match->GetBallRetainer() == player) {
         DO_VALIDATION;  // keeper fetched ball, probably
         actionCommand.desiredFunctionType = e_FunctionType_HighPass;
@@ -239,7 +272,7 @@ void ElizaController::RequestCommand(PlayerCommandQueue &commandQueue) {
 
         if (targetPlayer) {
           DO_VALIDATION;
-          // check if this player is away from opponents, before throwing ball to him
+          // 检查目标队友与最近对手的距离；距离>10m 或已持球超过4秒才传
           Player *closestOpp = AI_GetClosestPlayer(match->GetTeam(abs(team->GetID() - 1)), targetPlayer->GetPosition(), false, 0);
           if (closestOpp) {
             DO_VALIDATION;
@@ -252,7 +285,7 @@ void ElizaController::RequestCommand(PlayerCommandQueue &commandQueue) {
                               // forever
               actionCommand.touchInfo.forcedTargetPlayer = targetPlayer;
             } else {
-              doCommand = false;
+              doCommand = false; // 目标不安全，暂不传球
             }
           }
         }
@@ -260,16 +293,18 @@ void ElizaController::RequestCommand(PlayerCommandQueue &commandQueue) {
 
       if (doCommand) {
         DO_VALIDATION;
+        // 若未指定强制目标，寻找离目标位最近的队友
         if (actionCommand.touchInfo.forcedTargetPlayer == 0) actionCommand.touchInfo.forcedTargetPlayer = AI_GetClosestPlayer(team, desiredTargetPosition, false, CastPlayer());
+        // 调用AI传球计算：确定传球方向、力度、目标球员
         AI_GetPass(CastPlayer(), actionCommand.desiredFunctionType, actionCommand.touchInfo.inputDirection, actionCommand.touchInfo.inputPower, actionCommand.touchInfo.autoDirectionBias, actionCommand.touchInfo.autoPowerBias, actionCommand.touchInfo.desiredDirection, actionCommand.touchInfo.desiredPower, actionCommand.touchInfo.targetPlayer, actionCommand.touchInfo.forcedTargetPlayer);
         commandQueue.push_back(actionCommand);
       }
     }
 
-    // remember, we are still in the 'set piece / ballretainer' if{}
-
+    // 仍在定位球/持球 if 块内
     if (match->GetBallRetainer() != player) {
-      DO_VALIDATION;  // must be set piece taker, then
+      // 定位球执行球员：附加控球移动指令（保持在球旁边）
+      DO_VALIDATION;
       PlayerCommand command;
       command.desiredFunctionType = e_FunctionType_Movement;
       command.useDesiredMovement = true;
@@ -283,7 +318,7 @@ void ElizaController::RequestCommand(PlayerCommandQueue &commandQueue) {
 
       commandQueue.push_back(command);
       return;
-    } else {  // must be ball retainer
+    } else {  // 门将持球：站立，视线朝向传球方向
       PlayerCommand command;
       command.desiredFunctionType = e_FunctionType_Movement;
       command.useDesiredMovement = true;
@@ -302,19 +337,20 @@ void ElizaController::RequestCommand(PlayerCommandQueue &commandQueue) {
 
   }
 
-  // default strategies for defensively, midfielders and offensively positioned
-  // players
-
+  // -------------------------------------------------------
+  // 5. 无球跑位策略（后卫/中场/前锋，不含门将）
+  //    根据球员角色调用不同的 Strategy::RequestInput，
+  //    写入 rawInputDirection / rawInputVelocityFloat
+  // -------------------------------------------------------
   else if (match->IsInPlay() && !match->IsInSetPiece() &&
            match->GetBallRetainer() != player &&
            match->GetDesignatedPossessionPlayer() != player &&
            CastPlayer()->GetFormationEntry().role != e_PlayerRole_GK) {
-    DO_VALIDATION;  //(match->GetDesignatedPossessionPlayer() != player ||
-                    //(CastPlayer()->GetFormationEntry().role == e_PlayerRole_GK
-                    //&& !CastPlayer()->HasPossession()))) { DO_VALIDATION;
+    DO_VALIDATION;
     if (CastPlayer()->GetFormationEntry().role == e_PlayerRole_LB ||
         CastPlayer()->GetFormationEntry().role == e_PlayerRole_CB ||
         CastPlayer()->GetFormationEntry().role == e_PlayerRole_RB) {
+      // 后卫跑位：保守防线，兼顾逼抢
       DO_VALIDATION;
       defenseStrategy.RequestInput(this, _mentalImage, rawInputDirection,
                                    rawInputVelocityFloat);
@@ -323,10 +359,12 @@ void ElizaController::RequestCommand(PlayerCommandQueue &commandQueue) {
                CastPlayer()->GetFormationEntry().role == e_PlayerRole_CM ||
                CastPlayer()->GetFormationEntry().role == e_PlayerRole_RM ||
                CastPlayer()->GetFormationEntry().role == e_PlayerRole_AM) {
+      // 中场跑位：攻守均衡，随控球方向移动
       DO_VALIDATION;
       midfieldStrategy.RequestInput(this, _mentalImage, rawInputDirection,
                                     rawInputVelocityFloat);
     } else if (CastPlayer()->GetFormationEntry().role == e_PlayerRole_CF) {
+      // 前锋跑位：积极前插，寻找接球空间
       DO_VALIDATION;
       offenseStrategy.RequestInput(this, _mentalImage, rawInputDirection,
                                    rawInputVelocityFloat);
@@ -334,13 +372,16 @@ void ElizaController::RequestCommand(PlayerCommandQueue &commandQueue) {
 
   }
 
-  // dribble, pass, etcetera
+  // -------------------------------------------------------
+  // 6. 控球球员（场上指定持球者）：传球/射门/带球决策
+  // -------------------------------------------------------
   else if (match->IsInPlay() && !match->IsInSetPiece() &&
            match->GetDesignatedPossessionPlayer() == player &&
            (team->GetHumanGamerCount() == 0 ||
            (!CastPlayer()->ExternalControllerActive() && CastPlayer()->ExternalController())) &&
            CastPlayer()->GetFormationEntry().role != e_PlayerRole_GK) {
     DO_VALIDATION;
+    // 只有在能够1秒内到球时才触发在球行动
     if (CastPlayer()->GetTimeNeededToGetToBall_ms() < 1000) {
       DO_VALIDATION;
       GetOnTheBallCommands(commandQueue, rawInputDirection, rawInputVelocityFloat);
@@ -348,19 +389,22 @@ void ElizaController::RequestCommand(PlayerCommandQueue &commandQueue) {
     extraHaste = false;
   }
 
+  // -------------------------------------------------------
+  // 7. 门将专属逻辑
+  // -------------------------------------------------------
   else if (match->IsInPlay() && !match->IsInSetPiece() &&
            CastPlayer()->GetFormationEntry().role == e_PlayerRole_GK) {
     DO_VALIDATION;
-    // keeper's mental image for deflections is near-instant; let's just call it premonition ;)
+    // 门将的心理快照更新几乎是即时的（近似预知球的轨迹）
     goalieStrategy.CalculateIfBallIsBoundForGoal(this, _mentalImage);
     bool boundForGoal = goalieStrategy.IsBallBoundForGoal();
-    if (boundForGoal) manualMovement = true;
+    if (boundForGoal) manualMovement = true; // 球飞向球门→手动模式拦截
     if (CastPlayer() != match->GetDesignatedPossessionPlayer()) manualMovement = true;
     goalieStrategy.RequestInput(this, _mentalImage,
                                 manualMovementDirection,
                                 manualMovementVelocityFloat);
 
-    //if (boundForGoal && hasUniquePossession) printf("has unique possession, so no deflect anims (poss: %f)\n", possessionAmount);
+    // 没有绝对控球时，尝试扑球/接球动画
     if (!hasUniquePossession || possessionAmount < 3.4f) {
       DO_VALIDATION;
       bool onlyPickupAnims = false;
@@ -368,6 +412,7 @@ void ElizaController::RequestCommand(PlayerCommandQueue &commandQueue) {
       _KeeperDeflectCommand(commandQueue, onlyPickupAnims);
     }
 
+    // 门将接近球且被指定为控球者时，也执行在球决策（传球/带球）
     if (CastPlayer()->GetTimeNeededToGetToBall_ms() < 1000 &&
         match->GetDesignatedPossessionPlayer() == player) {
       DO_VALIDATION;
@@ -375,9 +420,12 @@ void ElizaController::RequestCommand(PlayerCommandQueue &commandQueue) {
     }
   }
 
+  // -------------------------------------------------------
+  // 8. 全员通用：球控/停球/干扰/滑铲
+  // -------------------------------------------------------
   bool forceMagnet = false;
 
-  // team pressure
+  // 队伍整体施压：若本球员被指定为施压球员，强制朝对方控球者方向移动
   float ballDistance = _mentalImage->GetBallPrediction(0).Get2D().GetDistance(player->GetPosition());
   if (match->IsInPlay() && !match->IsInSetPiece() &&
       ((team->GetController()->GetEndApplyTeamPressure_ms() > match->GetActualTime_ms() && team->GetController()
@@ -387,7 +435,7 @@ void ElizaController::RequestCommand(PlayerCommandQueue &commandQueue) {
       match->GetDesignatedPossessionPlayer() != player &&
       CastPlayer()->GetFormationEntry().role != e_PlayerRole_GK) {
     DO_VALIDATION;
-    forceMagnet = true;
+    forceMagnet = true; // 磁力模式：无视跑位策略，直接向目标点冲
   }
 
   _SetInput(rawInputDirection, rawInputVelocityFloat);
@@ -398,30 +446,35 @@ void ElizaController::RequestCommand(PlayerCommandQueue &commandQueue) {
   if (match->IsInPlay() && !match->IsInSetPiece()) {
     DO_VALIDATION;
 
-    // ball control?
+    // 球控指令：尝试接管球（碰球、控球）
     _BallControlCommand(commandQueue, false, false, false); // last param true == enable sticky run direction.
 
-    // trap?
+    // 停球指令：尝试停住来球
     _TrapCommand(commandQueue);
 
-    // interfere?
+    // 干扰指令：尝试铲断或拦截对方
     bool byAnyMeans = false;
     _InterfereCommand(commandQueue, byAnyMeans);
 
-    // sliding?
+    // 滑铲指令：激进抢球
     _SlidingCommand(commandQueue);
   }
 
-  // movement
+  // -------------------------------------------------------
+  // 9. 移动指令（非门将拦截状态）
+  // -------------------------------------------------------
   if (!manualMovement && match->IsInPlay() && !match->IsInSetPiece()) {
     DO_VALIDATION;
 
+    // 对方持球球员
     Player *opp = match->GetTeam(abs(team->GetID() - 1))->GetDesignatedTeamPossessionPlayer();
 
     if (CastPlayer() != match->GetDesignatedPossessionPlayer()) {
       DO_VALIDATION;
 
       float mindSet = AI_GetMindSet(CastPlayer()->GetDynamicFormationEntry().role);
+      // 追球距离阈值：防守型球员追球半径更大（守得更远）
+      // 受体力、平均速度、AI难度影响
       float huntDistanceThreshold = 10.0f + (1.0f - mindSet) * 10.0f; // 10 + .. * 10
       huntDistanceThreshold *= 0.5f * CastPlayer()->GetFatigueFactorInv() +
                                0.5f * (1.0f - NormalizedClamp(CastPlayer()->GetAverageVelocity(10), idleVelocity, sprintVelocity));
@@ -429,9 +482,8 @@ void ElizaController::RequestCommand(PlayerCommandQueue &commandQueue) {
           0.3f + CastPlayer()->GetTeam()->GetAiDifficulty() * 0.7f;
 
       if (forceMagnet) {
+        // 施压模式：朝向己方底线方向移动（把对方推离禁区）
         DO_VALIDATION;
-
-        // make sure the movement command magnets get the best input (which is then used as 'hint' for the 'toball' functions)
 
         inputDirection = Vector3(team->GetDynamicSide() * pitchHalfW, 0, 0) -
                          CastPlayer()->GetPosition();
@@ -443,23 +495,21 @@ void ElizaController::RequestCommand(PlayerCommandQueue &commandQueue) {
                   (CastPlayer()->GetPosition() +
                    CastPlayer()->GetMovement() * 0.04f))
                          .GetLength() < huntDistanceThreshold) {
-        DO_VALIDATION;  // defend player
+        // 对方持球者在追球阈值内 → 主动防守/逼抢
+        DO_VALIDATION;
 
         if (player == team->GetDesignatedTeamPossessionPlayer() &&
             possessionAmount > 0.8f) {
           DO_VALIDATION;
-          forceMagnet = true;  // don't give up battles too easily
+          forceMagnet = true;  // 已在争抢中，不轻易放弃
           extraHaste = true;
         }
-
-        // or, defend an opponent, if we don't have anything better to do anyway
 
         Player *opp = match->GetTeam(abs(team->GetID() - 1))
                           ->GetDesignatedTeamPossessionPlayer();
 
-        int huntingPlayersNum =
-            2;  // remember, this includes players with man marking id that are
-                // not controlled by this hunting code
+        // 最多2名球员同时追球（包括盯人球员）
+        int huntingPlayersNum = 2;
         std::vector<Player *> closestPlayers;
         AI_GetClosestPlayers(team,
                              opp->GetPosition() + opp->GetMovement() * 0.1f,
@@ -489,7 +539,7 @@ void ElizaController::RequestCommand(PlayerCommandQueue &commandQueue) {
           //forceMagnet = true; // more aggressive!
           */
 
-          // more 'hunting' method
+          // "追猎"方法：计算防守站位，向其移动
           Vector3 defendPosition = GetDefendPosition(opp);
           if (NeedDefendingMovement(team->GetDynamicSide(),
                                     player->GetPosition(), defendPosition)) {
@@ -500,7 +550,7 @@ void ElizaController::RequestCommand(PlayerCommandQueue &commandQueue) {
                 (defendPosition - CastPlayer()->GetPosition()).GetLength() *
                     distanceToVelocityMultiplier,
                 0.0f, sprintVelocity);
-            forceMagnet = true;  // more aggressive!
+            forceMagnet = true;  // 激进逼抢
           }
 
         }  // close
@@ -509,12 +559,14 @@ void ElizaController::RequestCommand(PlayerCommandQueue &commandQueue) {
 
     }  // !designated
 
-    inputVelocityFloat = RangeVelocity(inputVelocityFloat); // emulate controller quantization
+    // 将速度量化（模拟手柄档位分级）
+    inputVelocityFloat = RangeVelocity(inputVelocityFloat);
 
+    // 生成最终移动指令（结合跑位策略输出 + 磁力/紧迫标志）
     _MovementCommand(commandQueue, forceMagnet, extraHaste);
 
-  } else {  // keeper?
-
+  } else {
+    // 门将拦截状态：直接使用手动方向/速度，视线锁定球
     PlayerCommand command;
     command.desiredFunctionType = e_FunctionType_Movement;
     command.useDesiredMovement = true;
@@ -542,76 +594,104 @@ float ElizaController::GetFloatVelocity() {
   return lastDesiredVelocity;
 }
 
+// ============================================================
+// GetLazyVelocity —— 根据情境给期望速度打"懒惰折扣"
+// 模拟球员在不需要全力的情况下节省体力的行为。
+// 三个维度决定懒惰程度：
+//   1. lazinessByPosition：离球越远越懒（距离阈值20~65米）
+//   2. lazinessByRole：进攻型球员在己方控球时偷懒；后卫反之
+//   3. breathLeftFactor：短期冲刺后喘气减速（工作率属性调节）
+// ============================================================
 float ElizaController::GetLazyVelocity(float desiredVelocityFloat) {
   DO_VALIDATION;
 
-  // input is unclamped! use large values (less lazy, apparently we are more off-position)
+  // 输入速度未做限制；超过冲刺速度的部分只保留10%，避免溢出导致极端值
   float adaptedDesiredVelocityFloat = desiredVelocityFloat;
-  // don't use full overflow though
   if (adaptedDesiredVelocityFloat > sprintVelocity) adaptedDesiredVelocityFloat = sprintVelocity + (adaptedDesiredVelocityFloat - sprintVelocity) * 0.1f;
 
+  // 懒惰生效的距离区间（受体力影响：体力越差，懒惰越早生效）
   float startLazinessDistance = 20.0f * (CastPlayer()->GetFatigueFactorInv() * 0.8f + 0.2f);
   float endLazinessDistance = 65.0f * (CastPlayer()->GetFatigueFactorInv() * 0.5f + 0.5f);
 
   Vector3 oppPos = match->GetTeam(abs(team->GetID() - 1))->GetDesignatedTeamPossessionPlayer()->GetPosition();
-  float actionDistance = (player->GetPosition() - oppPos).GetLength();
-  float teamPossession = clamp(GetFadingTeamPossessionAmount() - 0.5f, 0.0f, 1.0f);
+  float actionDistance = (player->GetPosition() - oppPos).GetLength(); // 与对方控球者的距离
+  float teamPossession = clamp(GetFadingTeamPossessionAmount() - 0.5f, 0.0f, 1.0f); // 己方控球程度 [0,1]
   float mindSet = AI_GetMindSet(CastPlayer()->GetDynamicFormationEntry().role);
 
-  // if mindSet is high (offensive), be lazy when teamPossession is low. and the other way round for defenders.
-  // (midfielders are always half-lazy by role this way; pow() them a bit if this is undesired; this will of course wear them out more than backs and strikers)
+  // 角色懒惰因子：
+  //   进攻型(mindSet=1)：己方控球时节省体力（等球来），失球时拼命跑
+  //   防守型(mindSet=0)：己方控球时积极跑位，失球时守住阵型
   float lazinessByRole = mindSet + teamPossession * (1.0f - mindSet * 2.0f);
+  // 位置懒惰因子：离动作中心越远，越放松
   float lazinessByPosition = NormalizedClamp(actionDistance, startLazinessDistance, endLazinessDistance);
 
   float lazyFactor = lazinessByPosition * (0.5f + lazinessByRole * 0.5f);
   float resultingVelocityFloat = adaptedDesiredVelocityFloat * (1.0f - lazyFactor);
 
+  // 若期望速度≥带球速度，确保结果也不低于带球速度（不能原地停下）
   bool clampToDribble = false;
-  if (desiredVelocityFloat >= dribbleVelocity) clampToDribble = true; // no standing still when initially undesired; it would get us further and further away from our desired position *edit: no longer true with the unclamped input
+  if (desiredVelocityFloat >= dribbleVelocity) clampToDribble = true;
   if (clampToDribble && resultingVelocityFloat < dribbleVelocity) resultingVelocityFloat = dribbleVelocity;
 
-  // short term fatigue/work rate shortage ;)
-  // does not heed dribble clamp above, as to simulate players having to stop to catch their breath
+  // 短期疲劳（喘气）：近10帧平均速度越高，剩余"气"越少
+  // workRate属性越高的球员，喘气曲线越平缓（更耐跑）
   float breathLeftFactor = 1.0f - NormalizedClamp(CastPlayer()->GetAverageVelocity(10), idleVelocity, sprintVelocity);
   float workRate = CastPlayer()->GetStat(mental_workrate);
   breathLeftFactor = std::pow(breathLeftFactor, 0.8f - workRate * 0.2f);
-  breathLeftFactor = clamp(breathLeftFactor * 1.2f, 0.0f, 1.0f); // make sure beginning of sprint is full speed
-  breathLeftFactor = breathLeftFactor * lazyFactor + 1.0f * (1.0f - lazyFactor); // sometimes, we really need to force it
+  breathLeftFactor = clamp(breathLeftFactor * 1.2f, 0.0f, 1.0f); // 确保冲刺初始阶段是全速
+  // 在需要全力（lazyFactor低）的情况下不受喘气限制
+  breathLeftFactor = breathLeftFactor * lazyFactor + 1.0f * (1.0f - lazyFactor);
   resultingVelocityFloat = std::min(resultingVelocityFloat, sprintVelocity * breathLeftFactor);
 
   return resultingVelocityFloat;
 }
 
+// ============================================================
+// GetSupportPosition_ForceField —— 力场法计算无球支援跑位
+//
+// 核心思路：在球场上叠加多个"力场源"（吸引/排斥），
+// 通过合力求出当前球员的最优支援位置。
+// 各力场贡献：
+//   + 吸引：阵型基础位置（最重要）
+//   + 吸引：冲刺跑位目标（指定前插球员）
+//   + 吸引：控球队友附近（保持传球距离）
+//   - 排斥：对方球员（拉开空间）
+//   - 排斥：己方队友（避免堆在一起）
+//   - 排斥：球的预测路径（不挡传球线路）
+//   - 排斥：控球队友（太近会妨碍）
+// 最终位置额外受越位线约束。
+// ============================================================
 Vector3 ElizaController::GetSupportPosition_ForceField(
     const MentalImage *mentalImage, const Vector3 &basePosition, bool makeRun) {
   DO_VALIDATION;
   auto _mentalImage = match->GetMentalImage(_mentalImageTime);
   Player *designatedPlayer = team->GetDesignatedTeamPossessionPlayer();
 
-  Vector3 currentPos = player->GetPosition() + CastPlayer()->GetMovement() * 0.1f; //basePosition;
+  // 当前球员预测位置（考虑0.1秒后的移动）
+  Vector3 currentPos = player->GetPosition() + CastPlayer()->GetMovement() * 0.1f;
+  // 控球队友预测位置
   Vector3 mainManPos = designatedPlayer->GetPosition() + designatedPlayer->GetMovement() * 0.1f;
 
   std::vector<ForceSpot> forceField;
-
-
-  // support position
 
   float dynamicMindSet = AI_GetMindSet(CastPlayer()->GetDynamicFormationEntry().role);
   float ballDistance = (match->GetBall()->Predict(250).Get2D() - player->GetPosition()).GetLength();
   float ballDistanceX = fabs(match->GetBall()->Predict(250).coords[0] - player->GetPosition().coords[0]);
 
-  bool forceNoOffside = true;
+  bool forceNoOffside = true; // 禁止越位
 
+  // 各力场权重（可按需调节平衡进攻/防守性）
   float basePositionWeight = 0.7f;
   float overallWeight = 1.0f;
-  float opponentRepelWeight = 0.3f * overallWeight;
-  float teammateRepelWeight = 0.4f * overallWeight;
-  float ballRepelWeight = 1.0f * overallWeight;
-  float runWeight = 1.0f * overallWeight;
-  float flockToPossessionPlayerWeight = 0.45f * overallWeight;
+  float opponentRepelWeight = 0.3f * overallWeight; // 对方排斥权重（按角色放大）
+  float teammateRepelWeight = 0.4f * overallWeight; // 队友排斥权重
+  float ballRepelWeight = 1.0f * overallWeight;     // 球路排斥权重
+  float runWeight = 1.0f * overallWeight;            // 前插跑权重
+  float flockToPossessionPlayerWeight = 0.45f * overallWeight; // 靠近控球者权重
 
-  float webScale = 0.75f;
+  float webScale = 0.75f; // 整体力场范围缩放
 
+  // 后卫/中场对对方的排斥更强（防守意识更强，不让对方靠近）
   switch (CastPlayer()->GetDynamicFormationEntry().role) {
     DO_VALIDATION;
     case e_PlayerRole_CB:
@@ -637,34 +717,30 @@ Vector3 ElizaController::GetSupportPosition_ForceField(
       break;
   }
 
+  // 越位线（对方防线位置），用于最终约束
   float offsideX =
       AI_GetOffsideLine(match, _mentalImage, abs(team->GetID() - 1), 240);
   float adaptedMakeRun = makeRun;
 
-  // actual base position
+  // --- 力场1：阵型基础位置（吸引） ---
   {
     ForceSpot spot;
     spot.origin = basePosition;
 
-    // let left and right flank flow forwards and backwards every period_sec seconds, for some dynamics
-    // except for one close player, who should always run forward for support
     Player *forwardSupportPlayer = team->GetController()->GetForwardSupportPlayer();
     if (player == forwardSupportPlayer) {
+      // 指定前插球员：在基础位置上额外向前推（进攻性越强推得越远）
       DO_VALIDATION;
       spot.origin.coords[0] +=
           -team->GetDynamicSide() * (0.3f + 0.7f * dynamicMindSet) * 12.0f;
     } else {
-      /* sine version
-      float amount = 8.0f;//14.0f;//8.0f;
-      float period_sec = 7.0f;
-      float phase_offset = NormalizedClamp(currentPos.coords[1], -pitchHalfH, pitchHalfH);
-      amount *= sin(match->GetActualTime_ms() * 0.001f * ((1.0f / period_sec) * 2.0f * pi) + (phase_offset * 2.0f * pi)) * 0.5f + 0.5f;
-      float delta = -team->GetSide() * curve(dynamicMindSet, 0.5f) * (1.0f - pow(NormalizedClamp(ballDistanceX, 1.0f, 30.0f), 1.5f)) * amount; // offensive crew
-      spot.origin.coords[0] += delta;
+      /* sine version（正弦波版本，已弃用）
+      ...
       */
-      // lane version
+      // 通道版本：根据当前球员与控球者的y轴位置关系，向前推进
       float amount = 22.0f;
       float laneY = -signSide(mainManPos.coords[1]) * 8.0f;
+      // 越靠近laneY的球员，前插幅度越大
       amount *= curve(1.0f - NormalizedClamp(fabs(laneY - currentPos.coords[1]), 0.0f, 30.0f), 1.0f);
       float delta =
           -team->GetDynamicSide() * std::pow(dynamicMindSet, 1.5f) * amount;
@@ -674,25 +750,27 @@ Vector3 ElizaController::GetSupportPosition_ForceField(
     spot.magnetType = e_MagnetType_Attract;
     spot.decayType = e_DecayType_Constant;
     spot.power = 1.0f * basePositionWeight;
-    // the farther away from this position, the more we are attracted to it
+    // 越远离目标位，引力越强（让球员坚持跑到位）
     spot.power *= 0.3f + 0.7f * NormalizedClamp((spot.origin - currentPos).GetLength(), 0.0f, 20.0f);
     forceField.push_back(spot);
   }
 
+  // --- 力场2：前插跑目标（吸引，仅限makeRun=true球员） ---
   if (adaptedMakeRun) {
     DO_VALIDATION;
     ForceSpot spot;
+    // 目标：对方底线附近（纵向位置跟随自身，横向全力前插）
     spot.origin = Vector3(-team->GetDynamicSide() * pitchHalfW,
                           currentPos.coords[1] * 0.5f,
-                          0.0f);  // player->GetDirectionVec() * 100.0f;// /
-                                  // distanceToVelocityMultiplier;
+                          0.0f);
     spot.magnetType = e_MagnetType_Attract;
     spot.decayType = e_DecayType_Constant;
     spot.power = 2.0f * runWeight;
     forceField.push_back(spot);
   }
 
-  // stay away from opponents
+  // --- 力场3：远离对方球员（排斥） ---
+  // 取离控球者附近最近的3名对手
   std::vector<Player*> opponents;
   AI_GetClosestPlayers(match->GetTeam(abs(team->GetID() - 1)), mainManPos * 0.3f + currentPos + 0.7f, false, opponents, 3);
   for (unsigned int i = 0; i < opponents.size(); i++) {
@@ -700,12 +778,14 @@ Vector3 ElizaController::GetSupportPosition_ForceField(
     const PlayerImage &oppImg = mentalImage->GetPlayerImage(opponents[i]);
     ForceSpot spot;
     Vector3 oppPos = oppImg.position + oppImg.movement * 0.1f;
-    spot.origin = oppPos + (oppPos - mainManPos).GetNormalized(0) * 2.0f; // anti-magnet behind opponent, because the pass-way must be cleared
+    // 排斥源放在对手身后，确保传球路线畅通
+    spot.origin = oppPos + (oppPos - mainManPos).GetNormalized(0) * 2.0f;
     spot.magnetType = e_MagnetType_Repel;
     spot.decayType = e_DecayType_Variable;
     spot.power = 1.0f * opponentRepelWeight;
     spot.scale = 5.0f;
     if (adaptedMakeRun) {
+      // 前插时对对手排斥减弱（更激进）
       DO_VALIDATION;
       spot.scale = 2.0f;
       spot.power *= 0.5f;
@@ -714,7 +794,8 @@ Vector3 ElizaController::GetSupportPosition_ForceField(
     forceField.push_back(spot);
   }
 
-  // stay away from teammates
+  // --- 力场4：远离己方队友（排斥，拉开间距） ---
+  // 仅在己方控球时生效（控球量≥1.02）
   if (team->GetFadingTeamPossessionAmount() >= 1.02f) {
     DO_VALIDATION;
     std::vector<Player*> players;
@@ -736,7 +817,8 @@ Vector3 ElizaController::GetSupportPosition_ForceField(
     }
   }
 
-  // stay away from ball (to not get in the way of passes and possessionplayer)
+  // --- 力场5：远离球的预测轨迹（排斥，不挡传球路线） ---
+  // 仅在己方有明显控球优势时生效（控球量≥1.06）
   if (CastPlayer() != designatedPlayer &&
       team->GetFadingTeamPossessionAmount() >= 1.06f) {
     DO_VALIDATION;
@@ -746,6 +828,7 @@ Vector3 ElizaController::GetSupportPosition_ForceField(
     spot.power = 1.0f * ballRepelWeight;
     spot.scale = 2.0f;
     spot.exp = 0.5f;
+    // 在未来200~650ms的球的预测位置上各放一个排斥源
     spot.origin = mentalImage->GetBallPrediction(200).Get2D();
     forceField.push_back(spot);
     spot.origin = mentalImage->GetBallPrediction(350).Get2D();
@@ -756,10 +839,11 @@ Vector3 ElizaController::GetSupportPosition_ForceField(
     forceField.push_back(spot);
   }
 
+  // --- 力场6/7：靠近控球队友（吸引）但不要太近（排斥） ---
   if (CastPlayer() != designatedPlayer) {
     DO_VALIDATION;
 
-    // attract to teammate in possession
+    // 吸引：靠近控球队友（保持传球距离）
     {
       ForceSpot spot;
       spot.origin = mainManPos;
@@ -771,7 +855,7 @@ Vector3 ElizaController::GetSupportPosition_ForceField(
       forceField.push_back(spot);
     }
 
-    // ..yet not too close
+    // 排斥：不要离控球队友太近（避免挡路）
     {
       ForceSpot spot;
       spot.origin = mainManPos;
@@ -784,8 +868,10 @@ Vector3 ElizaController::GetSupportPosition_ForceField(
     }
   }
 
-  Vector3 forceFieldPosition = currentPos + AI_GetForceFieldMovement(forceField, currentPos, 7);//8);
+  // 合力计算：当前位置 + 力场合力移动量
+  Vector3 forceFieldPosition = currentPos + AI_GetForceFieldMovement(forceField, currentPos, 7);
 
+  // 越位线约束：确保不越位（留0.08m余量）
   float margin = 0.08f;
   if (forceNoOffside)
     if (forceFieldPosition.coords[0] * -team->GetDynamicSide() >
@@ -793,6 +879,7 @@ Vector3 ElizaController::GetSupportPosition_ForceField(
       forceFieldPosition.coords[0] =
           offsideX - (margin * -team->GetDynamicSide());
 
+  // 边界约束：不能出界
   forceFieldPosition.coords[0] = clamp(forceFieldPosition.coords[0], -pitchHalfW, pitchHalfW);
   forceFieldPosition.coords[1] = clamp(forceFieldPosition.coords[1], -pitchHalfH, pitchHalfH);
 
@@ -813,63 +900,78 @@ void ElizaController::ProcessState(EnvState *state) {
   state->process(lastDesiredVelocity);
 }
 
+// ============================================================
+// GetOnTheBallCommands —— 控球球员的传/射/带球决策
+//
+// 决策流程：
+//   Step 1: 计算自身战术评分（向前空间、空间、向前性）
+//   Step 2: 遍历所有队友，找战术评分更好且传球成功率高的人
+//   Step 3: 若在己方危险区域且没有好选择 → 慌乱解围（panic pass）
+//   Step 4: 若找到合适传球目标 → 传球
+//   Step 5: 若在射门区域且射门成功率足够 → 射门
+//   Step 6: 带球移动（占用rawInputDirection/rawInputVelocityFloat）
+// ============================================================
 void ElizaController::GetOnTheBallCommands(
     std::vector<PlayerCommand> &commandQueue, Vector3 &rawInputDirection,
     float &rawInputVelocityFloat) {
   DO_VALIDATION;
   auto _mentalImage = match->GetMentalImage(_mentalImageTime);
+  // 一脚触球难度：球速与球员速度差越大、技术越差，一触难度越高
   float oneTouchIsHard = 0.0f;
   float movementDiff = NormalizedClamp((match->GetBall()->GetMovement() - CastPlayer()->GetMovement()).GetLength(), 0.0f, 10.0f);
   oneTouchIsHard = movementDiff - CastPlayer()->GetStat(technical_shortpass) * movementDiff * 0.8f;
 
+  // 对方球员的心理快照位置（用于评估传球成功率）
   auto opponentPlayerImages = _mentalImage->GetTeamPlayerImages(abs(team->GetID() - 1));
 
 
-  // DECIDE WHAT TO DO
+  // ---- Step 1: 当前局势评估 ----
 
+  // 持球时长因子：持球越久越急于传球（指数增长）
   float longPossessionFactor = pow(NormalizedClamp(CastPlayer()->GetPossessionDuration_ms(), 0, 5000), 2.0f);
 
-  // first selection
-  float forwardSpaceWeight = 0.4f;
-  float spaceWeight = 0.3f;
-  float forwardWeight = 2.0f + AI_GetMindSet(CastPlayer()->GetDynamicFormationEntry().role) * 6.0f;
+  // 战术评分权重（第一轮筛选：目标必须比自己强）
+  float forwardSpaceWeight = 0.4f; // 向前有空间的权重
+  float spaceWeight = 0.3f;        // 整体空间的权重
+  float forwardWeight = 2.0f + AI_GetMindSet(CastPlayer()->GetDynamicFormationEntry().role) * 6.0f; // 进攻性越强越重视向前传
 
   float totalWeight1 = forwardSpaceWeight + spaceWeight + forwardWeight;
-  float tacticalImprovementThreshold = 0.06f * (1.0f - AI_GetMindSet(CastPlayer()->GetDynamicFormationEntry().role)); // only go on with pass selection if recipient has this much tactical advantage over current player
+  // 战术改善阈值：目标队友必须比自己高这么多才传（防守型球员要求更高）
+  float tacticalImprovementThreshold = 0.06f * (1.0f - AI_GetMindSet(CastPlayer()->GetDynamicFormationEntry().role));
 
-  // second selection
+  // 传球总评分权重（第二轮筛选：战术差距 × 权重 + 传球成功率 × 权重）
   float tacticalDiffWeight =
       1.0f +
       std::pow(AI_GetMindSet(CastPlayer()->GetDynamicFormationEntry().role),
                2.0f) *
-          10.0f;
+          10.0f; // 进攻型球员：战术差距权重高（宁可冒险传好位置）
   float passWeight = 1.0f;
+  // 传球成功率最低阈值（持球越久越愿意接受低成功率传球）
   float passMinimum = 0.2f * (1.0f - AI_GetMindSet(CastPlayer()->GetDynamicFormationEntry().role)) - longPossessionFactor * 0.1f;
 
   float totalWeight2 = tacticalDiffWeight + passWeight;
 
-  // name says it all
+  // 传球总评分必须超过此阈值才会传球（持球越久阈值越低）
   float passThreshold = 0.1f - longPossessionFactor * 0.05f;
 
-  // self rating
+  // 自身战术评分
   const TacticalPlayerSituation &sit = CastPlayer()->GetTacticalSituation();
   float tacticalRating = sit.forwardSpaceRating * forwardSpaceWeight +
                          sit.spaceRating * spaceWeight +
                          sit.forwardRating * forwardWeight;
-
   tacticalRating /= totalWeight1;
 
-  // collect pass target candidates
+  // ---- Step 2: 遍历队友，找最佳传球目标 ----
   std::vector<Player*> mates;
   team->GetActivePlayers(mates);
 
   struct MateRating {
     Player *player;
     float tacticalRating = 0.0f;
-    float tacticalDiffRating = 0.0f;
-    float passRating = 0.0f;
+    float tacticalDiffRating = 0.0f; // 相对自身的战术改善程度
+    float passRating = 0.0f;          // 传球成功率
     float proximityRating = 0.0f;
-    e_FunctionType passType;
+    e_FunctionType passType;          // 最优传球类型（短/长/高）
   };
 
   float bestTotalRating = 0.0f;
@@ -891,18 +993,20 @@ void ElizaController::GetOnTheBallCommands(
                                  mateSit.forwardRating * forwardWeight;
 
       mateTacticalRating /= totalWeight1;
-      if (mates[i]->GetFormationEntry().role == e_PlayerRole_GK) mateTacticalRating *= 0.7f; // don't like playing back to goalie
+      if (mates[i]->GetFormationEntry().role == e_PlayerRole_GK) mateTacticalRating *= 0.7f; // 不喜欢回传门将
 
       MateRating mateRating;
       mateRating.player = mates[i];
       mateRating.tacticalRating = mateTacticalRating;
 
+      // 只考虑战术评分比自己高的队友
       if (mateTacticalRating > tacticalRating + tacticalImprovementThreshold) {
         DO_VALIDATION;
 
         float tacticalDiffRating = mateRating.tacticalRating - tacticalRating;
 
         mateRating.tacticalDiffRating = tacticalDiffRating;
+        // 分别计算短传/长传/高球的传球成功率，选最高的
         float passingOddsShort = _GetPassingOdds(mates[i], e_FunctionType_ShortPass, opponentPlayerImages);
         float passingOddsLong  = _GetPassingOdds(mates[i], e_FunctionType_LongPass,  opponentPlayerImages);
         float passingOddsHigh  = _GetPassingOdds(mates[i], e_FunctionType_HighPass,  opponentPlayerImages);
@@ -920,12 +1024,13 @@ void ElizaController::GetOnTheBallCommands(
           mateRating.passType = e_FunctionType_HighPass;
         }
 
+        // 综合评分 = 战术改善贡献 + 传球成功率贡献 - 一触难度惩罚
         float totalRating = mateRating.tacticalDiffRating * tacticalDiffWeight +
                             mateRating.passRating * passWeight -
                             oneTouchIsHard;
-
         totalRating /= totalWeight2;
 
+        // 只有超过阈值且传球成功率足够才记录为候选
         if (totalRating > bestTotalRating && totalRating > passThreshold &&
             mateRating.passRating > passMinimum) {
           DO_VALIDATION;
@@ -938,11 +1043,12 @@ void ElizaController::GetOnTheBallCommands(
     }  // !self
   }
 
-  // panic
+  // ---- Step 3: 慌乱解围（后卫/门将在危险区域时） ----
   float mindSet = AI_GetMindSet(CastPlayer()->GetDynamicFormationEntry().role);
-  if (mindSet < 0.25f) {
+  if (mindSet < 0.25f) { // 防守型球员（后卫/守门员）
     DO_VALIDATION;
-    float panicProneness = 1.0f - mindSet * 2.0f;
+    float panicProneness = 1.0f - mindSet * 2.0f; // 防守越纯，越容易慌乱
+    // 离己方球门越近，越慌乱
     float goalCloseness =
         1.0f -
         NormalizedClamp(
@@ -950,16 +1056,17 @@ void ElizaController::GetOnTheBallCommands(
              Vector3(pitchHalfW * CastPlayer()->GetTeam()->GetDynamicSide(), 0,
                      0))
                 .GetLength(),
-            2.0f, 16.0f);  // 8.0f, 32.0f);
+            2.0f, 16.0f);
     if (CastPlayer()->GetDynamicFormationEntry().role != e_PlayerRole_GK) {
       DO_VALIDATION;
+      // 没有好的传球目标 或 控球不稳 → 慌乱解围
       if ((bestMateRating.player == 0 ||
            bestMateRating.passRating < panicProneness * goalCloseness) &&
           possessionAmount < 0.9f + panicProneness * goalCloseness * 0.8f) {
         DO_VALIDATION;
         _AddPanicPass(commandQueue);
       }
-    } else {  // keeper
+    } else {  // 门将：控球量低于3.0时随时触发慌乱解围
       if (possessionAmount < 3.0f) {
         DO_VALIDATION;
         _AddPanicPass(commandQueue);
@@ -967,17 +1074,20 @@ void ElizaController::GetOnTheBallCommands(
     }
   }
 
+  // ---- Step 4: 执行传球 ----
   if (bestMateRating.player != 0) {
     DO_VALIDATION;
     _AddPass(commandQueue, bestMateRating.player, bestMateRating.passType);
   }
 
-  // shoot?
+  // ---- Step 5: 射门判断 ----
+  // 到对方球门的归一化距离（0=紧贴球门，1=32米外）
   float goalDist =
       NormalizedClamp((Vector3(pitchHalfW * -team->GetDynamicSide(), 0, 0) -
                        player->GetPosition())
                           .GetLength(),
                       0.0f, 32.0f);
+  // 理想射门位置因子：距离球门7米以内为最佳射门区
   float idealShotPosFactor =
       1.0f - NormalizedClamp(
                  (Vector3((pitchHalfW - 7.0f) * -team->GetDynamicSide(), 0, 0) -
@@ -987,6 +1097,7 @@ void ElizaController::GetOnTheBallCommands(
   idealShotPosFactor = curve(idealShotPosFactor, 1.0f);
   if (idealShotPosFactor > 0.1f) {
     DO_VALIDATION;
+    // 分别计算球门左中右三点的射门成功率（球速倍率3.0）
     float odds1 = _GetPassingOdds(
         Vector3((pitchHalfW + 1.0f) * -team->GetDynamicSide(), -3.6f, 0),
         e_FunctionType_Shot, opponentPlayerImages, 3.0f);
@@ -996,6 +1107,7 @@ void ElizaController::GetOnTheBallCommands(
     float odds3 = _GetPassingOdds(
         Vector3((pitchHalfW + 1.0f) * -team->GetDynamicSide(), 3.6f, 0),
         e_FunctionType_Shot, opponentPlayerImages, 3.0f);
+    // 选择成功率最高的射门角度
     float odds = odds2; float y = 0.0f;
     if (odds1 > odds) {
       DO_VALIDATION;
@@ -1008,15 +1120,17 @@ void ElizaController::GetOnTheBallCommands(
       y = 3.5f;
     }
 
-    odds = std::pow(odds, 0.5f);
+    odds = std::pow(odds, 0.5f); // 平方根：让低odds也有一定机会
 
+    // 加随机因子模拟球员判断失误；超过0.5才真正射门
     if (odds + boostrandom(0.0f, 0.5f) > 0.5f) {
       DO_VALIDATION;
       PlayerCommand command;
       command.desiredFunctionType = e_FunctionType_Shot;
       command.useDesiredMovement = false;
       command.useDesiredLookAt = false;
-      command.desiredVelocityFloat = rawInputVelocityFloat; // this is so we can use sprint/dribble buttons as shot modifiers
+      command.desiredVelocityFloat = rawInputVelocityFloat;
+      // 射门方向：球门目标点 + 技术属性决定的随机偏差（技术差偏差大）
       command.touchInfo.desiredDirection =
           (Vector3((pitchHalfW + 1.0f) * -team->GetDynamicSide(),
                    y + boostrandom(-1.0f + player->GetStat(technical_shot),
@@ -1024,14 +1138,17 @@ void ElizaController::GetOnTheBallCommands(
                    0) -
            (CastPlayer()->GetPosition() + CastPlayer()->GetMovement() * 0.2f))
               .GetNormalized(Vector3(-team->GetDynamicSide(), 0, 0));
+      // 混合球员移动方向（模拟带速度射门时方向的微小偏移）
       command.touchInfo.desiredDirection = (command.touchInfo.desiredDirection * 0.7f + -CastPlayer()->GetDirectionVec() * (CastPlayer()->GetFloatVelocity() / sprintVelocity) * 0.3f).GetNormalized();
       command.touchInfo.autoDirectionBias = 1.0f;
+      // 射门力度随距离调整：越远越需要大力
       command.touchInfo.desiredPower = boostrandom(
           0.7f * (0.6f + goalDist * 0.4f), 1.0f * (0.6f + goalDist * 0.4f));
       commandQueue.push_back(command);
     }
   }
 
+  // ---- Step 6: 带球移动（通过rawInputDirection/rawInputVelocityFloat输出） ----
   e_Velocity enumVelocity = e_Velocity_Idle;
   AI_GetBestDribbleMovement(match, player, _mentalImage,
                             rawInputDirection, rawInputVelocityFloat,
@@ -1091,6 +1208,10 @@ void ElizaController::_AddPanicPass(std::vector<PlayerCommand> &commandQueue) {
   commandQueue.push_back(command);
 }
 
+// ============================================================
+// _GetPassingOdds（重载1）—— 以目标球员为目标计算传球成功率
+// 考虑目标球员的预测位置（减速时间）和长传的向前偏置
+// ============================================================
 float ElizaController::_GetPassingOdds(
     Player *targetPlayer, e_FunctionType passType,
     const std::vector<PlayerImagePosition> &opponentPlayerImages,
@@ -1098,61 +1219,85 @@ float ElizaController::_GetPassingOdds(
   DO_VALIDATION;
 
   float initialTargetDistance = (targetPlayer->GetPosition() - player->GetPosition()).GetLength();
+  // 高球传球距离不足10米无意义
   if (passType == e_FunctionType_HighPass && initialTargetDistance < 10.0f) return 0.0f;
+  // 估算球到达目标的时间
   float estimatedTime_sec = 0.7f + initialTargetDistance * 0.03f;
 
-  Vector3 target = targetPlayer->GetPosition() + targetPlayer->GetMovement() * clamp(estimatedTime_sec, 0.0f, 0.5f); // time needed to brake
+  // 目标位置 = 队友当前位置 + 刹车时间内的移动量
+  Vector3 target = targetPlayer->GetPosition() + targetPlayer->GetMovement() * clamp(estimatedTime_sec, 0.0f, 0.5f);
   if (passType == e_FunctionType_LongPass)
+    // 长传目标前置：球员跑到接球点时已经向前跑了一段
     target +=
         Vector3(-team->GetDynamicSide() * initialTargetDistance * 0.2f, 0, 0);
 
   return _GetPassingOdds(target, passType, opponentPlayerImages, ballVelocityMultiplier);
 }
 
+// ============================================================
+// _GetPassingOdds（重载2）—— 以空间位置为目标计算传球成功率
+//
+// 算法：在传球路线上画一条线，对每个对手：
+//   1. 计算对手到这条线的最近点（截球点u）和距离
+//   2. 计算对手跑到截球点的时间 vs 球到截球点的时间
+//   3. 若对手能比球先到（或差不多），则增加危险值
+// odds = 1 - 归一化危险值
+// ============================================================
 float ElizaController::_GetPassingOdds(
     const Vector3 &target, e_FunctionType passType,
     const std::vector<PlayerImagePosition> &opponentPlayerImages,
     float ballVelocityMultiplier) {
   DO_VALIDATION;
 
-  float secondScale = 1.0f; // how many seconds of range to measure danger in
+  float secondScale = 1.0f; // 危险度测量的时间窗口（秒）
 
+  // 起点：发球者预测位置（0.12秒后）
   Vector3 origin = player->GetPosition() + player->GetMovement() * 0.12f;
 
-  // draw imaginary line between this and target player
+  // 传球路线（从发球者到目标）
   Line line(origin, target);
 
   float danger = 0.0f;
   for (unsigned int opp = 0; opp < opponentPlayerImages.size(); opp++) {
     DO_VALIDATION;
-    Vector3 oppPos = opponentPlayerImages.at(opp).position + opponentPlayerImages.at(opp).movement * 0.2f; // + time needed to brake
-    float u = 0.0f; // % of line opp is closest to (0 .. 1)
+    // 对手预测位置（0.2秒后，考虑刹车）
+    Vector3 oppPos = opponentPlayerImages.at(opp).position + opponentPlayerImages.at(opp).movement * 0.2f;
+    float u = 0.0f; // 对手在传球线上的最近点比例（0=发球端，1=接球端）
     float oppDistance = 0.0f;
     oppDistance = line.GetDistanceToPoint(oppPos, u);
 
+    // 只考虑在传球路线范围内的对手（稍微延伸到1.2以防止接球点被忽略）
     if (u >= 0.0f && u <= 1.0f + 0.2f) {
-      DO_VALIDATION;  // opp is dangerous in the first place
+      DO_VALIDATION;
+      // 高球：路线的中间段（0.2~0.65）是低空飞行段，对手较难截；
+      // 起点和终点段正常计算
       if ((passType == e_FunctionType_HighPass && (u < 0.2f || u > 0.65f)) ||
           passType != e_FunctionType_HighPass) {
         DO_VALIDATION;
         float clampedU = clamp(u, 0.0f, 1.0f);
-        Vector3 intersect = origin * (1.0f - clampedU) + target * clampedU; // where opp is most likely to intercept ball
+        // 截球点（对手最可能截到球的位置）
+        Vector3 intersect = origin * (1.0f - clampedU) + target * clampedU;
 
-        float oppToIntersect_sec = (oppDistance + 1.0f) / sprintVelocity; // add some distance to correct for acceleration
+        // 对手跑到截球点的时间（距离+1加速修正）/全速
+        float oppToIntersect_sec = (oppDistance + 1.0f) / sprintVelocity;
 
         Vector3 originToBallPos = (intersect - origin);
-        float penaltyTime = (passType == e_FunctionType_HighPass && u > 0.5f) ? 2.5f : 0.0f; // trapping high balls takes time
+        // 高球接球需要额外时间停球（落点后半段才算）
+        float penaltyTime = (passType == e_FunctionType_HighPass && u > 0.5f) ? 2.5f : 0.0f;
         float ballToIntersect_sec = 0.7f + originToBallPos.GetLength() * u * 0.03f + penaltyTime;
         ballToIntersect_sec *= 1.0f / ballVelocityMultiplier;
 
-        danger += clamp(ballToIntersect_sec - oppToIntersect_sec + (secondScale * 0.5f), 0.0f, secondScale); // add some seconds because 0 seconds doesn't mean 0 danger
+        // 时间差→危险度：球比对手先到0.5秒以上才是安全的
+        danger += clamp(ballToIntersect_sec - oppToIntersect_sec + (secondScale * 0.5f), 0.0f, secondScale);
       }
     }
   }
 
-  if (passType == e_FunctionType_HighPass) danger += 0.4f; // just don't prefer high passing when low passing is applicable as well
+  // 高球天然有额外危险（比地面传球更难控制）
+  if (passType == e_FunctionType_HighPass) danger += 0.4f;
 
-  danger = NormalizedClamp(danger, 0.0f, secondScale); // 1 super dangerous dude is basically the same as 100% danger
+  // 归一化：1个极其危险的对手 ≈ 100%危险
+  danger = NormalizedClamp(danger, 0.0f, secondScale);
   float odds = 1.0f - danger;
 
   return odds;

@@ -73,11 +73,14 @@ Match::Match(MatchData *matchData, const std::vector<AIControlledKeyboard *> &co
 
   ball = new Ball(this);
 
+  // Animation assets: first Match in the process loads all .anim files via
+  // AnimCollection::Load() (player.object skeleton + media/animations). Later
+  // matches reuse GetContext().anims and only invalidate caches.
   if (!anims) {
     DO_VALIDATION;
     anims = boost::shared_ptr<AnimCollection>(new AnimCollection());
     anims->Load();
-    // cache animation positions
+    // Per-frame root positions on the ground (z=0) for AI / selection; see GetAnimPositionCache.
 
     const std::vector < Animation* > &animationsTmp = anims->GetAnimations();
     for (unsigned int i = 0; i < animationsTmp.size(); i++) {
@@ -100,7 +103,7 @@ Match::Match(MatchData *matchData, const std::vector<AIControlledKeyboard *> &co
       a->DirtyCache();
     }
   }
-  // full body model template
+  // Skinned mesh template (fullbody); skeleton for Animation::Apply comes from per-humanoid setup.
 
   ObjectLoader loader;
   if (!GetContext().fullbodyNode) {
@@ -1054,6 +1057,8 @@ void Match::UpdateCamera() {
   }
 }
 
+// After Match::Process (logic + humanoid frame advance), compute offsets before
+// Animation::Apply runs in FetchPutBuffers.
 void Match::PreparePutBuffers() {
   DO_VALIDATION;
   Mirror(false, false, first_team == 1);
@@ -1063,6 +1068,7 @@ void Match::PreparePutBuffers() {
   Mirror(false, false, first_team == 0);
 }
 
+// Applies current clip/frame to each humanoid node tree (see HumanoidBase::FetchPutBuffers).
 void Match::FetchPutBuffers() {
   DO_VALIDATION;
   DO_VALIDATION;
@@ -1071,6 +1077,7 @@ void Match::FetchPutBuffers() {
   officials->FetchPutBuffers();
 }
 
+// Propagate joint poses to fullbody meshes; CPU skinning refresh happens in GameTask::PrepareRender.
 void Match::Put() {
   DO_VALIDATION;
   bool reverse = GetScenarioConfig().reverse_team_processing;

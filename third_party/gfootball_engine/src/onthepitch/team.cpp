@@ -509,6 +509,7 @@ void Team::Process() {
   }
 }
 
+// Per-player: geometry offsets before skeletal Animation::Apply.
 void Team::PreparePutBuffers() {
   DO_VALIDATION;
   for (unsigned int i = 0; i < players.size(); i++) {
@@ -520,6 +521,7 @@ void Team::PreparePutBuffers() {
   }
 }
 
+// Per-player: apply current animation frame to joint nodes.
 void Team::FetchPutBuffers() {
   DO_VALIDATION;
   for (unsigned int i = 0; i < players.size(); i++) {
@@ -531,6 +533,7 @@ void Team::FetchPutBuffers() {
   }
 }
 
+// Update each player's fullbody mesh from joint poses (after FetchPutBuffers).
 void Team::Put(bool mirror) {
   DO_VALIDATION;
   for (unsigned int i = 0; i < players.size(); i++) {

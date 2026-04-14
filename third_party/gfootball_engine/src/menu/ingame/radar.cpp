@@ -194,40 +194,76 @@ void Gui2Radar::Put() {
                                  pos2d.coords[1] * height_percent - 0.8f);
   }
 
-  // ===== 射门力量槽更新 =====
-  // 遍历所有人类控制器，找到正在蓄力射门的玩家
-  // 只有 actionMode==2 且 actionButton==Shot 时才显示
+  // ===== 力量槽更新（射门/短传/高传复用同一槽，颜色区分） =====
+  // 射门：绿色；短传：蓝色；高传：青色
+  // actionMode==2 时显示，命令推入后冻结，动画完成后隐藏
+  // 传球均使用 shotPressStartTime_ms 时间戳（跨环境步），与射门相同机制
   {
     std::vector<HumanGamer *> humanGamers;
     match->GetTeam(0)->GetHumanControllers(humanGamers);
     match->GetTeam(1)->GetHumanControllers(humanGamers);
 
-    // 找第一个正在蓄力射门的人类控制器
-    // actionMode==2 且 actionButton==Shot 表示玩家正在蓄力射门
-    // 使用 shotPressStartTime_ms 计算跨环境步的真实按压时长
-    int shotGauge_ms = 0;
-    bool isShooting = false;
+    int displayGauge_ms = 0;
+    float displayPower = 0.0f;
+    int colorR = 0, colorG = 200, colorB = 20;
+    bool isActive = false;
+
     for (auto *gamer : humanGamers) {
       DO_VALIDATION;
       HumanController *hc = gamer->GetHumanController();
-      if (hc && !hc->Disabled() && hc->GetActionMode() == 2 &&
-          hc->GetActionButton() == e_ButtonFunction_Shot) {
-        DO_VALIDATION;
-        int queued = hc->GetShotQueuedGauge_ms();
-        if (queued >= 0) {
-          // 射门命令已推入队列：冻结在推入时的 gauge，不再随时间增长
-          shotGauge_ms = queued;
-        } else {
-          // 仍在蓄力中：用时间戳计算真实按压时长
-          int pressStart = hc->GetShotPressStartTime_ms();
-          if (pressStart >= 0) {
-            int elapsed = match->GetActualTime_ms() - pressStart;
-            shotGauge_ms = clamp(elapsed, 10, 1000);
-          } else {
-            shotGauge_ms = hc->GetGauge_ms();
-          }
+      if (!hc || hc->Disabled() || hc->GetActionMode() != 2) continue;
+      DO_VALIDATION;
+
+      e_ButtonFunction btn = hc->GetActionButton();
+
+      // 计算真实按压时长（推入后冻结，否则用时间戳实时计算）
+      auto getPassGauge = [&](int queued) -> int {
+        if (queued >= 0) return queued;
+        int pressStart = hc->GetShotPressStartTime_ms();
+        if (pressStart >= 0) {
+          int elapsed = match->GetActualTime_ms() - pressStart;
+          return clamp(elapsed, 10, 1000);
         }
-        isShooting = true;
+        return hc->GetGauge_ms();
+      };
+
+      if (btn == e_ButtonFunction_Shot) {
+        displayGauge_ms = getPassGauge(hc->GetShotQueuedGauge_ms());
+        // 射门：[60,500]ms，指数 2.0，球速 20~60 m/s
+        float gf = clamp((displayGauge_ms - 60) * (1.0f / 440.0f), 0.0f, 1.0f);
+        float dp = std::pow(gf, 2.0f);
+        displayPower = std::max(0.0f, std::min(1.0f, (20.0f + dp * 40.0f) / 60.0f));
+        colorR = (int)std::min(255.0f, 50 + 150 * displayPower);
+        colorG = (int)std::min(255.0f, 180 + 50 * displayPower);
+        colorB = 20;
+        isActive = true;
+        break;
+
+      } else if (btn == e_ButtonFunction_ShortPass) {
+        displayGauge_ms = getPassGauge(hc->GetPassQueuedGauge_ms());
+        // 短传：线性显示 gaugeFactor，代表"在最近～最远队友之间选了多远"
+        float gf = clamp((displayGauge_ms - 60) * (1.0f / 940.0f), 0.0f, 1.0f);
+        displayPower = gf;
+        colorR = 20; colorG = (int)std::min(255.0f, 100 + 100 * displayPower); colorB = 220;
+        isActive = true;
+        break;
+
+      } else if (btn == e_ButtonFunction_LongPass) {
+        displayGauge_ms = getPassGauge(hc->GetPassQueuedGauge_ms());
+        // 长传：线性
+        float gf = clamp((displayGauge_ms - 60) * (1.0f / 940.0f), 0.0f, 1.0f);
+        displayPower = gf;
+        colorR = 220; colorG = (int)std::min(255.0f, 120 + 80 * displayPower); colorB = 20;
+        isActive = true;
+        break;
+
+      } else if (btn == e_ButtonFunction_HighPass) {
+        displayGauge_ms = getPassGauge(hc->GetPassQueuedGauge_ms());
+        // 高传：线性
+        float gf = clamp((displayGauge_ms - 60) * (1.0f / 940.0f), 0.0f, 1.0f);
+        displayPower = gf;
+        colorR = 20; colorG = (int)std::min(255.0f, 200 + 55 * displayPower); colorB = (int)std::min(255.0f, 180 + 75 * displayPower);
+        isActive = true;
         break;
       }
     }
@@ -239,69 +275,31 @@ void Gui2Radar::Put() {
     if (pw < 1) pw = 1;
     if (ph < 1) ph = 1;
 
-    if (isShooting) {
+    if (isActive) {
       DO_VALIDATION;
-      // 首次进入蓄力状态：启用（显示）力量槽
       if (!shotPowerBarVisible) {
         DO_VALIDATION;
         shotPowerBar->Enable();
         shotPowerBarVisible = true;
       }
 
-      // 力量槽显示比例，与 humanoid_utils.cpp 射门球速公式完全一致：
-      //   shotGaugeFactor = (gauge_ms - 60) / (500 - 60)   [0~1]
-      //   desiredPower    = pow(shotGaugeFactor, 0.6)       [0~1]
-      //   estimatedSpeed  = 20 + desiredPower * 40          [20~60 m/s]
-      //   displayRatio    = estimatedSpeed / 60             [33%~100%]
-      // 短按（gauge_ms→0）→ desiredPower≈0 → 33%（20 m/s）
-      // 长按（gauge_ms→500ms）→ desiredPower=1 → 100%（60 m/s）
-      const int baseTime_ms = 60;
-      const int maxTrigger_ms = 500;
-      float shotGaugeFactor = (shotGauge_ms - baseTime_ms) *
-                              (1.0f / float(maxTrigger_ms - baseTime_ms));
-      shotGaugeFactor = std::max(0.0f, std::min(1.0f, shotGaugeFactor));
-
-      // pow(2.0) 与 humancontroller.cpp desiredPower 计算公式一致
-      // 上凸曲线：短按力量极弱，长按才线性增强
-      float desiredPower = std::pow(shotGaugeFactor, 2.0f);
-
-      // 与 humanoid_utils.cpp 中 adaptedDesiredPower 公式一致：20 + dp*40
-      const float maxBallSpeed = 60.0f;
-      float estimatedSpeed = 20.0f + desiredPower * 40.0f;
-      float power = std::max(0.0f, std::min(1.0f, estimatedSpeed / maxBallSpeed));
-
-      printf("[RADAR] shotGauge_ms=%d  shotGaugeFactor=%.3f  desiredPower=%.3f  estimatedSpeed=%.2f  displayRatio=%.3f\n",
-             shotGauge_ms, shotGaugeFactor, desiredPower, estimatedSpeed, power);
-
-
-      // 绘制力量槽：先清空（深灰色背景，半透明），再用绿色填充已积攒的部分
-      // 外框：深灰色（稍透明）
+      // 外框：深灰色背景
       shotPowerBar->DrawRectangle(0, 0, pw, ph, Vector3(30, 30, 30), 200);
-      // 1px 边框留白（视觉效果）
-      int innerX = 1;
-      int innerY = 1;
-      int innerW = pw - 2;
-      int innerH = ph - 2;
+      int innerX = 1, innerY = 1;
+      int innerW = pw - 2, innerH = ph - 2;
       if (innerW < 1) { innerW = pw; innerX = 0; }
       if (innerH < 1) { innerH = ph; innerY = 0; }
 
-      // 绿色填充：宽度等比于当前力量值（等比例显示）
-      int fillW = (int)std::round(innerW * power);
+      // 填充：宽度等比于 displayPower
+      int fillW = (int)std::round(innerW * displayPower);
       if (fillW > 0) {
         DO_VALIDATION;
-        // 根据力量大小选色：低力量为暗绿，高力量为亮绿（满力接近黄绿）
-        int r = (int)(50 + 150 * power);   // 随力量增大变亮
-        int g = (int)(180 + 50 * power);   // 绿色主色调
-        int b = 20;
-        r = std::min(r, 255);
-        g = std::min(g, 255);
         shotPowerBar->DrawRectangle(innerX, innerY, fillW, innerH,
-                                    Vector3(r, g, b), 230);
+                                    Vector3(colorR, colorG, colorB), 230);
       }
       shotPowerBar->OnChange();
     } else if (shotPowerBarVisible) {
       DO_VALIDATION;
-      // 射门结束：禁用（隐藏）力量槽
       shotPowerBar->Disable();
       shotPowerBarVisible = false;
     }

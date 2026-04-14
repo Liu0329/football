@@ -15,6 +15,7 @@
 
 """Player with actions coming from the keyboard."""
 
+import sys
 import pygame
 
 from gfootball.env import controller_base
@@ -55,6 +56,8 @@ class Player(controller_base.Controller):
     active_buttons = {}
     for event in event_queue.get('keyboard'):
       if event.type == pygame.KEYDOWN:
+        if event.key == pygame.K_ESCAPE:
+          sys.exit(0)
         actions = KEY_TO_ACTIONS.get(event.key, [])
         for a in actions:
           active_buttons[a] = 1

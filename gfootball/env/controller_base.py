@@ -30,16 +30,6 @@ class Controller(player_base.PlayerBase):
     self._last_direction = football_action_set.action_idle
     self._current_direction = football_action_set.action_idle
 
-  # 需要每帧持续发送（不做状态去重）的按键集合
-  # 射门需要持续发送，使 C++ 侧 gauge_ms 能在多个物理步内持续积累
-  _STICKY_SEND_ACTIONS = None
-
-  @classmethod
-  def _get_sticky_actions(cls):
-    if cls._STICKY_SEND_ACTIONS is None:
-      cls._STICKY_SEND_ACTIONS = {football_action_set.action_shot}
-    return cls._STICKY_SEND_ACTIONS
-
   def _check_action(self, action, active_actions):
     """Compare (and update) controller's state with the set of active actions.
 
@@ -51,13 +41,6 @@ class Controller(player_base.PlayerBase):
     if not action.is_in_actionset(self._env_config):
       return
     state = active_actions.get(action, 0)
-    # 射门按键：只要处于按住状态，每帧都发送 game_shot，让 C++ 侧持续看到按键为 true
-    # 普通按键：只在状态变化时发送（避免重复触发）
-    if action in self._get_sticky_actions() and state:
-      if self._last_action == football_action_set.action_idle:
-        self._active_actions[action] = state
-        self._last_action = action
-      return
     if (self._last_action == football_action_set.action_idle and
         self._active_actions.get(action, 0) != state):
       self._active_actions[action] = state
